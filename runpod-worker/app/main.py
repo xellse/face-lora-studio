@@ -32,7 +32,7 @@ R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 PUBLIC_STORAGE_BASE_URL = os.environ.get("PUBLIC_STORAGE_BASE_URL", "https://img.xellsun.com").rstrip("/")
 
-APP_VERSION = "0.1.2"
+APP_VERSION = "0.1.4"
 
 app = FastAPI(title="Face LoRA RunPod Worker", version=APP_VERSION)
 
@@ -108,7 +108,7 @@ def health():
         "datasetProcessing": {
             "visionProvider": "openrouter",
             "visionModel": OPENROUTER_MODEL,
-            "cropPolicy": "face_only_square_crop_no_stretch",
+            "cropPolicy": "face_center_square_crop_resize_only",
             "openRouterConfigured": bool(OPENROUTER_API_KEY),
             "r2Configured": bool(R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY),
         },
@@ -284,18 +284,19 @@ Return JSON only with this shape:
 {{
   "usable": true,
   "reason": "",
-  "bboxTarget": "face_only",
-  "containsBodyInBbox": false,
-  "bbox": {{"x": 0.25, "y": 0.12, "width": 0.5, "height": 0.42}},
+  "faceTarget": "face_head_only",
+  "containsBodyInFaceBox": false,
+  "face": {{"centerX": 0.50, "centerY": 0.34, "width": 0.34, "height": 0.42}},
+  "bbox": {{"x": 0.33, "y": 0.13, "width": 0.34, "height": 0.42}},
   "caption": "{trigger_word}, close-up portrait, ..."
 }}
 Rules:
 - The goal is a face LoRA dataset, not a full-body or half-body dataset.
-- bbox is a tight FACE/HEAD detection box before crop margin.
-- bbox must cover the main person's visible face, chin, forehead, ears, and hair only.
-- bbox must exclude shoulders, torso, arms, hands, clothing below the neck, watermarks, captions, and background text.
-- If the original photo is full-body or half-body, still return a tight bbox around the face/head only.
-- Set containsBodyInBbox=true if your bbox includes shoulders, torso, hands, or significant clothing below the neck.
+- face is the tight normalized geometry of the main person's visible face/head only.
+- face must cover the face oval, chin, forehead, ears, and hair mass only.
+- face and bbox must exclude shoulders, torso, arms, hands, clothing below the neck, watermarks, captions, and background text.
+- If the original photo is full-body or half-body, still return face geometry around the face/head only.
+- Set containsBodyInFaceBox=true if face/bbox includes shoulders, torso, hands, or significant clothing below the neck.
 - If the face is too small, too blurry, occluded, or there is no clear single main face, set usable=false and explain reason.
 - Caption should be concise visual training text and must not include names or identity claims.
 - Include the trigger word exactly once in the caption: {trigger_word}
@@ -342,50 +343,84 @@ def parse_json_object(content: Any) -> dict[str, Any]:
 
 def crop_face(image: Image.Image, analysis: dict[str, Any], crop_size: int) -> Image.Image:
     width, height = image.size
-    bbox = analysis.get("bbox")
-    if not isinstance(bbox, dict):
-        raise RuntimeError("Gemini did not return a valid bbox")
-    if analysis.get("containsBodyInBbox") is True:
-        raise RuntimeError("Gemini bbox includes body/shoulders instead of face only")
-    x = clamp(float(bbox.get("x", 0)), 0, 1)
-    y = clamp(float(bbox.get("y", 0)), 0, 1)
-    w = clamp(float(bbox.get("width", 1)), 0.05, 1)
-    h = clamp(float(bbox.get("height", 1)), 0.05, 1)
-    validate_face_bbox(x, y, w, h)
-    left = x * width
-    top = y * height
-    right = clamp((x + w) * width, left + 1, width)
-    bottom = clamp((y + h) * height, top + 1, height)
-    cx = (left + right) / 2
-    cy = (top + bottom) / 2
+    if analysis.get("containsBodyInFaceBox") is True:
+        raise RuntimeError("Gemini face geometry includes body/shoulders instead of face only")
 
-    face_width = right - left
-    face_height = bottom - top
-    side = max(face_width * 1.38, face_height * 1.28)
-    side = min(max(side, max(face_width, face_height) * 1.12), min(width, height))
-    side_px = max(2, int(round(side)))
+    face = normalized_face_geometry(analysis)
+    validate_face_geometry(face)
 
-    # Keep the face slightly high in the final square so chin is included without drifting into shoulders.
-    crop_left = int(round(cx - side_px / 2))
-    crop_top = int(round(cy - side_px * 0.50))
-    crop_left = clamp_int(crop_left, 0, width - side_px)
-    crop_top = clamp_int(crop_top, 0, height - side_px)
-    crop_box = (crop_left, crop_top, crop_left + side_px, crop_top + side_px)
-    cropped = image.crop(crop_box)
+    cx = face["centerX"] * width
+    cy = face["centerY"] * height
+    face_width = face["width"] * width
+    face_height = face["height"] * height
+
+    # Crop a square directly from the original image, centered on the detected face.
+    # Resizing this square to crop_size is proportional scaling, not distortion.
+    desired_side = max(face_width * 1.35, face_height * 1.25)
+    max_centered_side = max_square_side_centered_in_image(cx, cy, width, height)
+    side_px = int(round(min(desired_side, max_centered_side, min(width, height))))
+    side_px = max(2, side_px)
+
+    cropped = square_crop_centered_on_face(image, cx, cy, side_px)
     if cropped.width != cropped.height:
-        raise RuntimeError(f"Internal crop box was not square: {cropped.width}x{cropped.height}")
+        raise RuntimeError(f"Internal crop was not square: {cropped.width}x{cropped.height}")
+    if cropped.width == crop_size:
+        return cropped
     return cropped.resize((crop_size, crop_size), Image.Resampling.LANCZOS)
 
 
-def validate_face_bbox(x: float, y: float, width: float, height: float):
+def normalized_face_geometry(analysis: dict[str, Any]) -> dict[str, float]:
+    face = analysis.get("face")
+    if isinstance(face, dict):
+        return {
+            "centerX": clamp(float(face.get("centerX", 0.5)), 0, 1),
+            "centerY": clamp(float(face.get("centerY", 0.5)), 0, 1),
+            "width": clamp(float(face.get("width", 0.2)), 0.03, 1),
+            "height": clamp(float(face.get("height", 0.25)), 0.03, 1),
+        }
+
+    bbox = analysis.get("bbox")
+    if not isinstance(bbox, dict):
+        raise RuntimeError("Gemini did not return valid face geometry")
+    x = clamp(float(bbox.get("x", 0)), 0, 1)
+    y = clamp(float(bbox.get("y", 0)), 0, 1)
+    width = clamp(float(bbox.get("width", 1)), 0.03, 1)
+    height = clamp(float(bbox.get("height", 1)), 0.03, 1)
+    return {
+        "centerX": clamp(x + width / 2, 0, 1),
+        "centerY": clamp(y + height / 2, 0, 1),
+        "width": width,
+        "height": height,
+    }
+
+
+def validate_face_geometry(face: dict[str, float]):
+    width = face["width"]
+    height = face["height"]
     area = width * height
-    bottom = y + height
-    if width > 0.82 and height > 0.82:
-        raise RuntimeError("bbox covers almost the whole image, not a face-only crop")
-    if height > 0.72 and bottom > 0.92 and y > 0.04:
-        raise RuntimeError("bbox looks like upper-body/full-body framing, not face-only")
-    if area > 0.62 and y > 0.04:
-        raise RuntimeError("bbox area is too large for face-only training")
+    if width > 0.68 or height > 0.68:
+        raise RuntimeError("face geometry is too large and likely includes body framing")
+    if area > 0.34:
+        raise RuntimeError("face geometry area is too large for face-only training")
+    if width < 0.04 or height < 0.04:
+        raise RuntimeError("face geometry is too small for reliable training crop")
+
+
+def max_square_side_centered_in_image(center_x: float, center_y: float, width: int, height: int) -> int:
+    return max(2, int(2 * min(center_x, width - center_x, center_y, height - center_y)))
+
+
+def square_crop_centered_on_face(image: Image.Image, center_x: float, center_y: float, side_px: int) -> Image.Image:
+    width, height = image.size
+    side_px = min(side_px, width, height)
+    half = side_px / 2
+    left = int(round(center_x - half))
+    top = int(round(center_y - half))
+    left = clamp_int(left, 0, width - side_px)
+    top = clamp_int(top, 0, height - side_px)
+    right = left + side_px
+    bottom = top + side_px
+    return image.crop((left, top, right, bottom))
 
 
 def clamp(value: float, minimum: float, maximum: float) -> float:
