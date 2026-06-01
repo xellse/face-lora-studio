@@ -11,6 +11,10 @@ export default {
         return json(await getState(env), env, 200, request);
       }
 
+      if (request.method === "GET" && url.pathname === "/api/runpod/health") {
+        return json(await getRunPodHealth(env), env, 200, request);
+      }
+
       if (request.method === "POST" && url.pathname === "/api/uploads") {
         return json(await uploadObject(request, env), env, 201, request);
       }
@@ -68,6 +72,35 @@ async function getState(env) {
       publicStorageBaseUrl: env.PUBLIC_STORAGE_BASE_URL
     }
   };
+}
+
+async function getRunPodHealth(env) {
+  const baseUrl = (env.RUNPOD_WORKER_BASE_URL || "").replace(/\/$/, "");
+  if (!baseUrl) {
+    return {
+      configured: false,
+      reachable: false,
+      error: "RUNPOD_WORKER_BASE_URL is not configured"
+    };
+  }
+
+  const response = await fetch(`${baseUrl}/health`, {
+    headers: workerAuthHeaders(env)
+  });
+  const text = await response.text();
+  return {
+    configured: true,
+    reachable: response.ok,
+    status: response.status,
+    baseUrl,
+    body: parseJson(text, text)
+  };
+}
+
+function workerAuthHeaders(env) {
+  return env.RUNPOD_WORKER_TOKEN
+    ? { "X-Worker-Token": env.RUNPOD_WORKER_TOKEN }
+    : {};
 }
 
 async function uploadObject(request, env) {
