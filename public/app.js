@@ -9,8 +9,12 @@ const state = {
   trainingDraft: {},
   generationDraft: {},
   faceDrafts: {},
-  toast: ""
+  toast: "",
+  refreshTimer: null,
+  refreshing: false
 };
+
+let toastTimer = null;
 
 const tabs = [
   ["upload", "上传"],
@@ -26,18 +30,33 @@ async function init() {
   if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("/sw.js").then((registration) => registration.update()).catch(() => {});
   }
-  await refresh();
-  render();
-  setInterval(refresh, 1200);
+  await refresh({ force: true });
 }
 
-async function refresh() {
+async function refresh(options = {}) {
+  const { force = false, auto = false } = options;
+  if (state.refreshing) return;
+  if (auto && isEditing()) {
+    scheduleNextRefresh();
+    return;
+  }
+  state.refreshing = true;
   try {
     state.server = await api("/api/state");
-    render();
+    if (force || !isEditing()) render();
   } catch (error) {
     showToast(error.message);
+  } finally {
+    state.refreshing = false;
+    scheduleNextRefresh();
   }
+}
+
+function scheduleNextRefresh() {
+  if (state.refreshTimer) clearTimeout(state.refreshTimer);
+  const data = state.server || emptyServer();
+  const delay = activeJobs(data.jobs) ? 5000 : 30000;
+  state.refreshTimer = setTimeout(() => refresh({ auto: true }), delay);
 }
 
 function render() {
@@ -59,12 +78,12 @@ function render() {
         ${metrics(data)}
         ${route(data)}
       </section>
-      ${state.toast ? `<div class="toast">${escapeHtml(state.toast)}</div>` : ""}
     </main>
   `;
 
   bindGlobalEvents();
   bindTabEvents();
+  renderToast();
 }
 
 function route(data) {
@@ -377,7 +396,7 @@ function bindGlobalEvents() {
     });
   });
 
-  document.querySelector("[data-refresh]")?.addEventListener("click", refresh);
+  document.querySelector("[data-refresh]")?.addEventListener("click", () => refresh({ force: true }));
 
   document.querySelectorAll("[data-copy]").forEach((button) => {
     button.addEventListener("click", async () => {
@@ -402,7 +421,7 @@ function bindGlobalEvents() {
       });
       state.tab = "gallery";
       showToast("Generation queued");
-      await refresh();
+      await refresh({ force: true });
     });
   });
 }
@@ -441,7 +460,7 @@ function bindTabEvents() {
     state.uploadDraft = {};
     state.tab = "review";
     showToast("Dataset processing queued");
-    await refresh();
+    await refresh({ force: true });
   });
 
   document.querySelectorAll("[data-face-form]").forEach((form) => {
@@ -466,7 +485,7 @@ function bindTabEvents() {
       });
       delete state.faceDrafts[`${datasetId}:${faceId}`];
       showToast("Caption saved");
-      await refresh();
+      await refresh({ force: true });
     });
   });
 
@@ -475,7 +494,7 @@ function bindTabEvents() {
     await api("/api/training", { method: "POST", body: Object.fromEntries(new FormData(event.currentTarget)) });
     state.trainingDraft = {};
     showToast("Training queued");
-    await refresh();
+    await refresh({ force: true });
   });
 
   document.querySelector("#generationForm")?.addEventListener("submit", async (event) => {
@@ -484,7 +503,7 @@ function bindTabEvents() {
     state.generationDraft = {};
     state.tab = "gallery";
     showToast("Generation queued");
-    await refresh();
+    await refresh({ force: true });
   });
 }
 
@@ -543,7 +562,7 @@ function readFile(file) {
 }
 
 function activeJobs(jobs) {
-  return jobs.filter((job) => ["queued", "preparing", "running"].includes(job.status)).length;
+  return jobs.filter((job) => ["queued", "preparing", "processing", "running", "training"].includes(job.status)).length;
 }
 
 function emptyServer() {
@@ -558,11 +577,29 @@ function emptyServer() {
 
 function showToast(message) {
   state.toast = message;
-  render();
-  setTimeout(() => {
+  renderToast();
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
     state.toast = "";
-    render();
+    renderToast();
   }, 2400);
+}
+
+function renderToast() {
+  let root = document.querySelector("#toast-root");
+  if (!root) {
+    root = document.createElement("div");
+    root.id = "toast-root";
+    document.body.appendChild(root);
+  }
+  root.innerHTML = state.toast ? `<div class="toast">${escapeHtml(state.toast)}</div>` : "";
+}
+
+function isEditing() {
+  const element = document.activeElement;
+  if (!element || !app.contains(element)) return false;
+  if (element.isContentEditable) return true;
+  return ["INPUT", "TEXTAREA", "SELECT"].includes(element.tagName);
 }
 
 function escapeHtml(value) {
