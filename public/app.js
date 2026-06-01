@@ -5,6 +5,10 @@ const state = {
   server: null,
   selectedFiles: [],
   previews: [],
+  uploadDraft: {},
+  trainingDraft: {},
+  generationDraft: {},
+  faceDrafts: {},
   toast: ""
 };
 
@@ -83,6 +87,11 @@ function metrics(data) {
 }
 
 function uploadView(data) {
+  const draft = {
+    name: state.uploadDraft.name ?? `Portrait dataset ${data.datasets.length + 1}`,
+    triggerWord: state.uploadDraft.triggerWord ?? "person_lora",
+    cropSize: state.uploadDraft.cropSize ?? "1024"
+  };
   return `
     <section class="two-col">
       <form id="uploadForm" class="panel">
@@ -92,12 +101,12 @@ function uploadView(data) {
         </div>
         <div class="panel-body">
           <div class="form-grid">
-            <label>数据集名称<input name="name" value="Portrait dataset ${data.datasets.length + 1}" required /></label>
-            <label>触发词<input name="triggerWord" value="person_lora" required /></label>
+            <label>数据集名称<input name="name" value="${escapeHtml(draft.name)}" required /></label>
+            <label>触发词<input name="triggerWord" value="${escapeHtml(draft.triggerWord)}" required /></label>
             <label>裁切尺寸
               <select name="cropSize">
-                <option value="1024">1024 x 1024</option>
-                <option value="768">768 x 768</option>
+                <option value="1024" ${draft.cropSize === "1024" ? "selected" : ""}>1024 x 1024</option>
+                <option value="768" ${draft.cropSize === "768" ? "selected" : ""}>768 x 768</option>
               </select>
             </label>
           </div>
@@ -145,6 +154,8 @@ function reviewView(data) {
 }
 
 function faceItem(datasetId, face) {
+  const draftKey = `${datasetId}:${face.id}`;
+  const draft = state.faceDrafts[draftKey] ?? { caption: face.caption, status: face.status };
   return `
     <article class="item face-item">
       <img class="thumb" src="${face.localUrl}" alt="" />
@@ -153,10 +164,10 @@ function faceItem(datasetId, face) {
           <span class="tag ${face.status}">${face.status}</span>
           <button class="ghost" type="submit">保存</button>
         </div>
-        <textarea name="caption">${escapeHtml(face.caption)}</textarea>
+        <textarea name="caption">${escapeHtml(draft.caption)}</textarea>
         <select name="status">
-          <option value="approved" ${face.status === "approved" ? "selected" : ""}>approved</option>
-          <option value="excluded" ${face.status === "excluded" ? "selected" : ""}>excluded</option>
+          <option value="approved" ${draft.status === "approved" ? "selected" : ""}>approved</option>
+          <option value="excluded" ${draft.status === "excluded" ? "selected" : ""}>excluded</option>
         </select>
       </form>
     </article>
@@ -165,6 +176,19 @@ function faceItem(datasetId, face) {
 
 function trainView(data) {
   const readyDatasets = data.datasets.filter((dataset) => dataset.status === "ready_for_training");
+  const firstDataset = readyDatasets[0];
+  const draft = {
+    datasetId: state.trainingDraft.datasetId ?? firstDataset?.id ?? "",
+    loraName: state.trainingDraft.loraName ?? `Portrait LoRA ${data.loras.length + 1}`,
+    triggerWord: state.trainingDraft.triggerWord ?? firstDataset?.triggerWord ?? "person_lora",
+    baseModel: state.trainingDraft.baseModel ?? "z-image-base",
+    steps: state.trainingDraft.steps ?? "3000",
+    learningRate: state.trainingDraft.learningRate ?? "1e-4",
+    rank: state.trainingDraft.rank ?? "32",
+    repeats: state.trainingDraft.repeats ?? "10",
+    resolution: state.trainingDraft.resolution ?? "1024",
+    saveEvery: state.trainingDraft.saveEvery ?? "250"
+  };
   return `
     <section class="two-col">
       <form id="trainingForm" class="panel">
@@ -175,21 +199,21 @@ function trainView(data) {
         <div class="panel-body">
           <div class="form-grid">
             <label>数据集
-              <select name="datasetId" required>${readyDatasets.map((dataset) => `<option value="${dataset.id}">${escapeHtml(dataset.name)}</option>`).join("")}</select>
+              <select name="datasetId" required>${readyDatasets.map((dataset) => `<option value="${dataset.id}" ${draft.datasetId === dataset.id ? "selected" : ""}>${escapeHtml(dataset.name)}</option>`).join("")}</select>
             </label>
-            <label>LoRA 名称<input name="loraName" value="Portrait LoRA ${data.loras.length + 1}" required /></label>
-            <label>触发词<input name="triggerWord" value="${readyDatasets[0]?.triggerWord || "person_lora"}" required /></label>
+            <label>LoRA 名称<input name="loraName" value="${escapeHtml(draft.loraName)}" required /></label>
+            <label>触发词<input name="triggerWord" value="${escapeHtml(draft.triggerWord)}" required /></label>
             <label>基础模型
               <select name="baseModel">
-                <option value="z-image-base" selected>Z-Image Base</option>
+                <option value="z-image-base" ${draft.baseModel === "z-image-base" ? "selected" : ""}>Z-Image Base</option>
               </select>
             </label>
-            <label>训练步数<input name="steps" type="number" value="3000" min="1000" step="100" /></label>
-            <label>学习率<input name="learningRate" value="1e-4" /></label>
-            <label>Rank<input name="rank" type="number" value="32" min="16" max="128" /></label>
-            <label>图片重复<input name="repeats" type="number" value="10" min="1" max="50" /></label>
-            <label>训练分辨率<input name="resolution" type="number" value="1024" min="512" max="1536" step="128" /></label>
-            <label>保存间隔<input name="saveEvery" type="number" value="250" min="50" step="50" /></label>
+            <label>训练步数<input name="steps" type="number" value="${escapeHtml(draft.steps)}" min="1000" step="100" /></label>
+            <label>学习率<input name="learningRate" value="${escapeHtml(draft.learningRate)}" /></label>
+            <label>Rank<input name="rank" type="number" value="${escapeHtml(draft.rank)}" min="16" max="128" /></label>
+            <label>图片重复<input name="repeats" type="number" value="${escapeHtml(draft.repeats)}" min="1" max="50" /></label>
+            <label>训练分辨率<input name="resolution" type="number" value="${escapeHtml(draft.resolution)}" min="512" max="1536" step="128" /></label>
+            <label>保存间隔<input name="saveEvery" type="number" value="${escapeHtml(draft.saveEvery)}" min="50" step="50" /></label>
           </div>
           <button type="submit" ${readyDatasets.length ? "" : "disabled"}>启动训练</button>
         </div>
@@ -206,6 +230,19 @@ function trainView(data) {
 
 function generateView(data) {
   const readyLoras = data.loras.filter((lora) => lora.status === "ready");
+  const draft = {
+    loraId: state.generationDraft.loraId ?? readyLoras[0]?.id ?? "",
+    prompt: state.generationDraft.prompt ?? "editorial portrait, clean background, cinematic light, sharp details",
+    negativePrompt: state.generationDraft.negativePrompt ?? "blur, low quality, distorted face, extra fingers",
+    count: state.generationDraft.count ?? "4",
+    width: state.generationDraft.width ?? "1024",
+    height: state.generationDraft.height ?? "1024",
+    seed: state.generationDraft.seed ?? "",
+    steps: state.generationDraft.steps ?? "40",
+    cfg: state.generationDraft.cfg ?? "5",
+    sampler: state.generationDraft.sampler ?? "euler",
+    loraWeight: state.generationDraft.loraWeight ?? "0.85"
+  };
   return `
     <section class="two-col">
       <form id="generationForm" class="panel">
@@ -215,25 +252,25 @@ function generateView(data) {
         </div>
         <div class="panel-body">
           <label>LoRA
-            <select name="loraId" required>${readyLoras.map((lora) => `<option value="${lora.id}">${escapeHtml(lora.name)} · ${escapeHtml(lora.triggerWord)}</option>`).join("")}</select>
+            <select name="loraId" required>${readyLoras.map((lora) => `<option value="${lora.id}" ${draft.loraId === lora.id ? "selected" : ""}>${escapeHtml(lora.name)} · ${escapeHtml(lora.triggerWord)}</option>`).join("")}</select>
           </label>
-          <label>正向提示词<textarea name="prompt" required>editorial portrait, clean background, cinematic light, sharp details</textarea></label>
-          <label>负向提示词<textarea name="negativePrompt">blur, low quality, distorted face, extra fingers</textarea></label>
+          <label>正向提示词<textarea name="prompt" required>${escapeHtml(draft.prompt)}</textarea></label>
+          <label>负向提示词<textarea name="negativePrompt">${escapeHtml(draft.negativePrompt)}</textarea></label>
           <div class="form-grid">
-            <label>数量<input name="count" type="number" value="4" min="1" max="12" /></label>
-            <label>宽度<input name="width" type="number" value="1024" min="512" max="1536" step="64" /></label>
-            <label>高度<input name="height" type="number" value="1024" min="512" max="1536" step="64" /></label>
-            <label>Seed<input name="seed" type="number" placeholder="random" /></label>
-            <label>Steps<input name="steps" type="number" value="40" min="20" max="80" /></label>
-            <label>CFG<input name="cfg" type="number" value="5" min="1" max="12" step="0.1" /></label>
+            <label>数量<input name="count" type="number" value="${escapeHtml(draft.count)}" min="1" max="12" /></label>
+            <label>宽度<input name="width" type="number" value="${escapeHtml(draft.width)}" min="512" max="1536" step="64" /></label>
+            <label>高度<input name="height" type="number" value="${escapeHtml(draft.height)}" min="512" max="1536" step="64" /></label>
+            <label>Seed<input name="seed" type="number" value="${escapeHtml(draft.seed)}" placeholder="random" /></label>
+            <label>Steps<input name="steps" type="number" value="${escapeHtml(draft.steps)}" min="20" max="80" /></label>
+            <label>CFG<input name="cfg" type="number" value="${escapeHtml(draft.cfg)}" min="1" max="12" step="0.1" /></label>
             <label>Sampler
               <select name="sampler">
-                <option value="euler">euler</option>
-                <option value="dpmpp_2m">dpmpp_2m</option>
-                <option value="dpmpp_sde">dpmpp_sde</option>
+                <option value="euler" ${draft.sampler === "euler" ? "selected" : ""}>euler</option>
+                <option value="dpmpp_2m" ${draft.sampler === "dpmpp_2m" ? "selected" : ""}>dpmpp_2m</option>
+                <option value="dpmpp_sde" ${draft.sampler === "dpmpp_sde" ? "selected" : ""}>dpmpp_sde</option>
               </select>
             </label>
-            <label>LoRA 权重<input name="loraWeight" type="number" value="0.85" min="0" max="1.5" step="0.05" /></label>
+            <label>LoRA 权重<input name="loraWeight" type="number" value="${escapeHtml(draft.loraWeight)}" min="0" max="1.5" step="0.05" /></label>
           </div>
           <button type="submit" ${readyLoras.length ? "" : "disabled"}>开始生成</button>
         </div>
@@ -371,6 +408,10 @@ function bindGlobalEvents() {
 }
 
 function bindTabEvents() {
+  bindDraftForm("#uploadForm", "uploadDraft");
+  bindDraftForm("#trainingForm", "trainingDraft");
+  bindDraftForm("#generationForm", "generationDraft");
+
   document.querySelector("#photoInput")?.addEventListener("change", async (event) => {
     state.selectedFiles = [...event.target.files];
     state.previews = await Promise.all(state.selectedFiles.slice(0, 10).map(readFile));
@@ -397,12 +438,21 @@ function bindTabEvents() {
     });
     state.selectedFiles = [];
     state.previews = [];
+    state.uploadDraft = {};
     state.tab = "review";
     showToast("Dataset processing queued");
     await refresh();
   });
 
   document.querySelectorAll("[data-face-form]").forEach((form) => {
+    form.addEventListener("input", () => {
+      const [datasetId, faceId] = form.dataset.faceForm.split(":");
+      state.faceDrafts[`${datasetId}:${faceId}`] = Object.fromEntries(new FormData(form));
+    });
+    form.addEventListener("change", () => {
+      const [datasetId, faceId] = form.dataset.faceForm.split(":");
+      state.faceDrafts[`${datasetId}:${faceId}`] = Object.fromEntries(new FormData(form));
+    });
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
       const [datasetId, faceId] = form.dataset.faceForm.split(":");
@@ -414,6 +464,7 @@ function bindTabEvents() {
           status: values.get("status")
         }
       });
+      delete state.faceDrafts[`${datasetId}:${faceId}`];
       showToast("Caption saved");
       await refresh();
     });
@@ -422,6 +473,7 @@ function bindTabEvents() {
   document.querySelector("#trainingForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     await api("/api/training", { method: "POST", body: Object.fromEntries(new FormData(event.currentTarget)) });
+    state.trainingDraft = {};
     showToast("Training queued");
     await refresh();
   });
@@ -429,10 +481,21 @@ function bindTabEvents() {
   document.querySelector("#generationForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     await api("/api/generation", { method: "POST", body: Object.fromEntries(new FormData(event.currentTarget)) });
+    state.generationDraft = {};
     state.tab = "gallery";
     showToast("Generation queued");
     await refresh();
   });
+}
+
+function bindDraftForm(selector, draftKey) {
+  const form = document.querySelector(selector);
+  if (!form) return;
+  const update = () => {
+    state[draftKey] = Object.fromEntries(new FormData(form));
+  };
+  form.addEventListener("input", update);
+  form.addEventListener("change", update);
 }
 
 async function uploadPhoto(file, uploadGroup, index) {
