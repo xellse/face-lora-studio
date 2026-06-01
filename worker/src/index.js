@@ -131,6 +131,9 @@ async function createDataset(request, env) {
   const datasetId = id("dataset");
   const uploadedPhotos = body.uploadedPhotos || [];
   const legacyPhotos = body.photos || [];
+  if (legacyPhotos.length && !uploadedPhotos.length) {
+    throw new Error("Your browser is running an old cached uploader. Please hard refresh app.xellsun.com or clear site data, then upload again.");
+  }
   const rawImages = uploadedPhotos.length
     ? uploadedPhotos.map((photo, index) => ({
         id: id("raw"),
@@ -148,45 +151,6 @@ async function createDataset(request, env) {
   )
     .bind(datasetId, USER_ID, body.name || "Portrait dataset", body.triggerWord || "person_lora", Number(body.cropSize || 1024), "processing", uploadedPhotos.length || legacyPhotos.length, now, now)
     .run();
-
-  for (let index = 0; index < legacyPhotos.length; index += 1) {
-    const photo = legacyPhotos[index];
-    const faceId = id("face");
-    const objectKey = `datasets/${datasetId}/faces/${faceId}.jpg`;
-    const data = dataUrlToBytes(photo.dataUrl);
-    await env.ASSETS.put(objectKey, data.bytes, {
-      httpMetadata: { contentType: data.contentType || photo.type || "image/jpeg" }
-    });
-    await env.DB.prepare(
-      "INSERT INTO faces (id, dataset_id, status, caption, object_key, https_url, crop_size, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
-    )
-      .bind(
-        faceId,
-        datasetId,
-        "approved",
-        `${body.triggerWord || "person_lora"}, close-up portrait, clean face crop, sharp facial detail`,
-        objectKey,
-        `${env.PUBLIC_STORAGE_BASE_URL}/${objectKey}`,
-        Number(body.cropSize || 1024),
-        now,
-        now
-      )
-      .run();
-  }
-
-  if (legacyPhotos.length) {
-    await env.DB.prepare("UPDATE datasets SET status = ?, updated_at = ? WHERE id = ?")
-      .bind("ready_for_training", nowIso(), datasetId)
-      .run();
-    const job = await insertJob(env, {
-      type: "dataset_processing",
-      status: "completed",
-      progress: 100,
-      datasetId,
-      message: "Legacy Base64 dataset imported to R2."
-    });
-    return { datasetId, job };
-  }
 
   let runpodJob;
   try {
