@@ -5,10 +5,12 @@ import shutil
 import subprocess
 import time
 import uuid
+import base64
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
+import boto3
 import requests
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from PIL import Image, ImageDraw
@@ -22,6 +24,13 @@ WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
 Z_IMAGE_BASE_MODEL = "z-image-base"
 Z_IMAGE_REPO = "Tongyi-MAI/Z-Image"
 AI_TOOLKIT_DIR = WORKSPACE / "ai-toolkit"
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-3-flash-preview")
+R2_ENDPOINT = os.environ.get("R2_ENDPOINT", "")
+R2_BUCKET = os.environ.get("R2_BUCKET", "face-lora-assets")
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+PUBLIC_STORAGE_BASE_URL = os.environ.get("PUBLIC_STORAGE_BASE_URL", "https://img.xellsun.com").rstrip("/")
 
 APP_VERSION = "0.1.0"
 
@@ -32,8 +41,19 @@ class DatasetJobRequest(BaseModel):
     dataset_id: str = Field(alias="datasetId")
     user_id: str = Field(default="local-user", alias="userId")
     raw_keys: list[str] = Field(default_factory=list, alias="rawKeys")
+    raw_images: list["RawImage"] = Field(default_factory=list, alias="rawImages")
     trigger_word: str = Field(default="person_lora", alias="triggerWord")
     crop_size: int = Field(default=1024, alias="cropSize")
+
+
+class RawImage(BaseModel):
+    id: str
+    index: int = 0
+    name: str | None = None
+    type: str | None = None
+    size: int | None = None
+    key: str | None = None
+    url: str
 
 
 class TrainingJobRequest(BaseModel):
@@ -85,6 +105,12 @@ def health():
             "architecture": "z-image",
             "repo": Z_IMAGE_REPO,
         },
+        "datasetProcessing": {
+            "visionProvider": "openrouter",
+            "visionModel": OPENROUTER_MODEL,
+            "openRouterConfigured": bool(OPENROUTER_API_KEY),
+            "r2Configured": bool(R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY),
+        },
         "workspace": str(WORKSPACE),
         "paths": {
             "jobs": str(JOBS_DIR),
@@ -99,7 +125,7 @@ def health():
 @app.post("/jobs/dataset", dependencies=[Depends(require_token)])
 def create_dataset_job(payload: DatasetJobRequest, background_tasks: BackgroundTasks):
     job = create_job("dataset_processing", payload.model_dump(by_alias=True))
-    background_tasks.add_task(simulate_dataset_processing, job["id"])
+    background_tasks.add_task(process_dataset, job["id"], payload)
     return job
 
 
@@ -170,14 +196,173 @@ def create_job(job_type: str, payload: dict[str, Any]) -> dict[str, Any]:
     return job
 
 
-def simulate_dataset_processing(job_id: str):
-    update_job(job_id, 20, "running", "Preparing raw photos")
-    time.sleep(1)
-    update_job(job_id, 55, "running", "Face crop/caption step placeholder")
-    time.sleep(1)
-    update_job(job_id, 100, "completed", "Dataset processing placeholder completed", {
-        "note": "Replace this step with face detection, crop, caption, and R2 upload.",
-    })
+def process_dataset(job_id: str, payload: DatasetJobRequest):
+    try:
+        if not payload.raw_images:
+            raise RuntimeError("No rawImages were provided")
+        if not OPENROUTER_API_KEY:
+            raise RuntimeError("OPENROUTER_API_KEY is not configured")
+        if not (R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY):
+            raise RuntimeError("R2 upload environment variables are not configured")
+
+        update_job(job_id, 8, "running", "Preparing Gemini crop/caption pipeline")
+        job_dir = JOBS_DIR / job_id
+        raw_dir = job_dir / "raw"
+        faces_dir = job_dir / "faces"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        faces_dir.mkdir(parents=True, exist_ok=True)
+
+        faces = []
+        review_items = []
+        for index, raw in enumerate(payload.raw_images, start=1):
+            update_job(job_id, min(90, 8 + int((index - 1) / max(1, len(payload.raw_images)) * 80)), "running", f"Processing image {index} of {len(payload.raw_images)}")
+            raw_path = raw_dir / f"{index:04d}_{safe_job_name(raw.name or raw.id)}.jpg"
+            source_image = download_image(raw.url)
+            source_image.save(raw_path, "JPEG", quality=95)
+
+            analysis = analyze_face_with_openrouter(raw.url, payload.trigger_word)
+            if not analysis.get("usable", True):
+                review_items.append({
+                    "id": raw.id,
+                    "reason": analysis.get("reason", "Gemini marked this image unusable"),
+                    "sourceUrl": raw.url,
+                })
+                continue
+
+            crop = crop_face(source_image, analysis.get("bbox"), payload.crop_size)
+            face_id = f"face_{uuid.uuid4().hex[:8]}"
+            face_path = faces_dir / f"{face_id}.jpg"
+            crop.save(face_path, "JPEG", quality=95)
+
+            caption = ensure_trigger_word(analysis.get("caption", ""), payload.trigger_word)
+            (faces_dir / f"{face_id}.txt").write_text(caption)
+            object_key = f"datasets/{payload.dataset_id}/faces/{face_id}.jpg"
+            https_url = upload_file_to_r2(face_path, object_key, "image/jpeg")
+            faces.append({
+                "id": face_id,
+                "status": "approved",
+                "caption": caption,
+                "objectKey": object_key,
+                "httpsUrl": https_url,
+                "cropSize": payload.crop_size,
+                "sourceUrl": raw.url,
+            })
+
+        update_job(job_id, 100, "completed", "Dataset crop and caption completed", {
+            "faces": faces,
+            "reviewItems": review_items,
+            "cropSize": payload.crop_size,
+            "visionModel": OPENROUTER_MODEL,
+        })
+    except Exception as exc:
+        update_job(job_id, 100, "failed", f"Dataset processing failed: {exc}", {
+            "error": str(exc),
+            "visionModel": OPENROUTER_MODEL,
+        })
+
+
+def download_image(url: str) -> Image.Image:
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    return Image.open(BytesIO(response.content)).convert("RGB")
+
+
+def analyze_face_with_openrouter(image_url: str, trigger_word: str) -> dict[str, Any]:
+    prompt = f"""Analyze this portrait training image for LoRA preparation.
+Return JSON only with this shape:
+{{
+  "usable": true,
+  "reason": "",
+  "bbox": {{"x": 0.25, "y": 0.12, "width": 0.5, "height": 0.58}},
+  "caption": "{trigger_word}, close-up portrait, ..."
+}}
+Rules:
+- bbox must cover the main person's face and hair in normalized 0..1 image coordinates.
+- If there is no clear single face, set usable=false and explain reason.
+- Caption should be concise visual training text and must not include names or identity claims.
+- Include the trigger word exactly once in the caption: {trigger_word}
+"""
+    response = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://app.xellsun.com",
+            "X-Title": "Face LoRA Studio",
+        },
+        json={
+            "model": OPENROUTER_MODEL,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                }
+            ],
+            "response_format": {"type": "json_object"},
+            "temperature": 0.2,
+        },
+        timeout=90,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    content = payload["choices"][0]["message"]["content"]
+    return parse_json_object(content)
+
+
+def parse_json_object(content: Any) -> dict[str, Any]:
+    if isinstance(content, dict):
+        return content
+    text = str(content).strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?", "", text).strip()
+        text = re.sub(r"```$", "", text).strip()
+    return json.loads(text)
+
+
+def crop_face(image: Image.Image, bbox: Any, crop_size: int) -> Image.Image:
+    width, height = image.size
+    if not isinstance(bbox, dict):
+        raise RuntimeError("Gemini did not return a valid bbox")
+    x = float(bbox.get("x", 0))
+    y = float(bbox.get("y", 0))
+    w = float(bbox.get("width", 1))
+    h = float(bbox.get("height", 1))
+    left = x * width
+    top = y * height
+    right = (x + w) * width
+    bottom = (y + h) * height
+    cx = (left + right) / 2
+    cy = (top + bottom) / 2
+    side = max(right - left, bottom - top) * 1.85
+    side = min(max(side, min(width, height) * 0.35), max(width, height))
+    left = max(0, cx - side / 2)
+    top = max(0, cy - side * 0.46)
+    right = min(width, left + side)
+    bottom = min(height, top + side)
+    left = max(0, right - side)
+    top = max(0, bottom - side)
+    cropped = image.crop((int(left), int(top), int(right), int(bottom)))
+    return cropped.resize((crop_size, crop_size), Image.Resampling.LANCZOS)
+
+
+def upload_file_to_r2(path: Path, key: str, content_type: str) -> str:
+    client = boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        region_name="auto",
+    )
+    client.upload_file(
+        str(path),
+        R2_BUCKET,
+        key,
+        ExtraArgs={"ContentType": content_type},
+    )
+    return f"{PUBLIC_STORAGE_BASE_URL}/{key}"
 
 
 def simulate_training(job_id: str, payload: TrainingJobRequest):

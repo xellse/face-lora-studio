@@ -5,7 +5,7 @@ This worker runs inside the RunPod persistent Pod on port `4000`.
 It provides:
 
 - `GET /health` for Cloudflare and manual checks
-- `POST /jobs/dataset` placeholder for face crop + caption
+- `POST /jobs/dataset` downloads raw images, asks OpenRouter Gemini for face bbox + caption, crops fixed-size face images, and uploads processed faces back to R2
 - `POST /jobs/train` downloads dataset images, writes captions, generates an AI Toolkit YAML config, runs `python run.py`, and installs the resulting `.safetensors` into ComfyUI
 - `POST /jobs/generate` placeholder for ComfyUI generation
 - `GET /jobs/{job_id}` for job status
@@ -33,6 +33,13 @@ python -m pip install -r requirements.txt
 export RUNPOD_WORKSPACE=/workspace
 export COMFY_BASE_URL=http://127.0.0.1:8188
 export WORKER_TOKEN="change-this-to-a-long-random-value"
+export OPENROUTER_API_KEY="your-openrouter-key"
+export OPENROUTER_MODEL="google/gemini-3-flash-preview"
+export R2_ENDPOINT="https://<account-id>.r2.cloudflarestorage.com"
+export R2_BUCKET="face-lora-assets"
+export R2_ACCESS_KEY_ID="your-r2-access-key-id"
+export R2_SECRET_ACCESS_KEY="your-r2-secret-access-key"
+export PUBLIC_STORAGE_BASE_URL="https://img.xellsun.com"
 
 tmux new -s face-worker
 python -m uvicorn app.main:app --host 0.0.0.0 --port 4000
@@ -60,3 +67,9 @@ For a training job `rp_xxx`, the worker writes:
 - AI Toolkit config: `/workspace/jobs/rp_xxx/z_image_base_ai_toolkit_config.yaml`
 - AI Toolkit output: `/workspace/jobs/rp_xxx/ai_toolkit_output`
 - Installed LoRA: `/workspace/ComfyUI/models/loras/local-user/{loraId}.safetensors`
+
+Dataset processing writes:
+
+- Raw downloaded images: `/workspace/jobs/rp_xxx/raw`
+- Cropped face images and captions: `/workspace/jobs/rp_xxx/faces`
+- R2 public images: `https://img.xellsun.com/datasets/{datasetId}/faces/{faceId}.jpg`

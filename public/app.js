@@ -380,19 +380,19 @@ function bindTabEvents() {
   document.querySelector("#uploadForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    const photos = await Promise.all(state.selectedFiles.map(async (file) => ({
-      name: file.name,
-      type: file.type,
-      size: file.size,
-      dataUrl: await readFile(file)
-    })));
+    const uploadGroup = crypto.randomUUID();
+    const uploadedPhotos = [];
+    for (const [index, file] of state.selectedFiles.entries()) {
+      showToast(`Uploading ${index + 1} of ${state.selectedFiles.length}`);
+      uploadedPhotos.push(await uploadPhoto(file, uploadGroup, index));
+    }
     await api("/api/datasets", {
       method: "POST",
       body: {
         name: form.get("name"),
         triggerWord: form.get("triggerWord"),
         cropSize: Number(form.get("cropSize")),
-        photos
+        uploadedPhotos
       }
     });
     state.selectedFiles = [];
@@ -433,6 +433,28 @@ function bindTabEvents() {
     showToast("Generation queued");
     await refresh();
   });
+}
+
+async function uploadPhoto(file, uploadGroup, index) {
+  const body = new FormData();
+  const safeName = file.name.replace(/[^a-zA-Z0-9._-]+/g, "_") || `portrait_${index + 1}.jpg`;
+  const key = `raw/local-user/${uploadGroup}/${String(index + 1).padStart(4, "0")}_${safeName}`;
+  body.set("key", key);
+  body.set("file", file);
+  const apiBaseUrl = window.FACE_LORA_CONFIG?.API_BASE_URL || "";
+  const response = await fetch(`${apiBaseUrl}/api/uploads`, {
+    method: "POST",
+    body
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || "Upload failed");
+  return {
+    name: file.name,
+    type: file.type,
+    size: file.size,
+    key: payload.key,
+    httpsUrl: payload.httpsUrl
+  };
 }
 
 async function api(path, options = {}) {

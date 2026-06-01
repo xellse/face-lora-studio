@@ -129,16 +129,28 @@ async function createDataset(request, env) {
   const body = await request.json();
   const now = nowIso();
   const datasetId = id("dataset");
-  const photos = body.photos || [];
+  const uploadedPhotos = body.uploadedPhotos || [];
+  const legacyPhotos = body.photos || [];
+  const rawImages = uploadedPhotos.length
+    ? uploadedPhotos.map((photo, index) => ({
+        id: id("raw"),
+        index,
+        name: photo.name,
+        type: photo.type,
+        size: photo.size,
+        key: photo.key,
+        url: photo.httpsUrl
+      }))
+    : [];
 
   await env.DB.prepare(
     "INSERT INTO datasets (id, user_id, name, trigger_word, crop_size, status, raw_photo_count, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
   )
-    .bind(datasetId, USER_ID, body.name || "Portrait dataset", body.triggerWord || "person_lora", Number(body.cropSize || 1024), "ready_for_training", photos.length, now, now)
+    .bind(datasetId, USER_ID, body.name || "Portrait dataset", body.triggerWord || "person_lora", Number(body.cropSize || 1024), "processing", uploadedPhotos.length || legacyPhotos.length, now, now)
     .run();
 
-  for (let index = 0; index < photos.length; index += 1) {
-    const photo = photos[index];
+  for (let index = 0; index < legacyPhotos.length; index += 1) {
+    const photo = legacyPhotos[index];
     const faceId = id("face");
     const objectKey = `datasets/${datasetId}/faces/${faceId}.jpg`;
     const data = dataUrlToBytes(photo.dataUrl);
@@ -162,12 +174,53 @@ async function createDataset(request, env) {
       .run();
   }
 
+  if (legacyPhotos.length) {
+    await env.DB.prepare("UPDATE datasets SET status = ?, updated_at = ? WHERE id = ?")
+      .bind("ready_for_training", nowIso(), datasetId)
+      .run();
+    const job = await insertJob(env, {
+      type: "dataset_processing",
+      status: "completed",
+      progress: 100,
+      datasetId,
+      message: "Legacy Base64 dataset imported to R2."
+    });
+    return { datasetId, job };
+  }
+
+  let runpodJob;
+  try {
+    runpodJob = await callRunPod(env, "/jobs/dataset", {
+      datasetId,
+      userId: USER_ID,
+      rawImages,
+      triggerWord: body.triggerWord || "person_lora",
+      cropSize: Number(body.cropSize || 1024)
+    });
+  } catch (error) {
+    await env.DB.prepare("UPDATE datasets SET status = ?, updated_at = ? WHERE id = ?")
+      .bind("failed", nowIso(), datasetId)
+      .run();
+    const failedJob = await insertJob(env, {
+      type: "dataset_processing",
+      status: "failed",
+      progress: 0,
+      datasetId,
+      message: `RunPod dataset request failed: ${error.message}`
+    });
+    return { datasetId, job: failedJob };
+  }
+
   const job = await insertJob(env, {
     type: "dataset_processing",
-    status: "completed",
-    progress: 100,
+    status: runpodJob.status || "queued",
+    progress: Number(runpodJob.progress || 0),
     datasetId,
-    message: "Dataset imported to R2. Replace this mock step with RunPod face crop/caption worker."
+    message: runpodJob.message || "Dataset processing queued on RunPod",
+    payload: {
+      runpodJobId: runpodJob.id,
+      runpodType: runpodJob.type
+    }
   });
 
   return { datasetId, job };
@@ -385,6 +438,11 @@ async function syncRunPodJob(env, localJob, runpodJob) {
     .bind(status, progress, message, JSON.stringify(logs), nowIso(), localJob.id)
     .run();
 
+  if (localJob.type === "dataset_processing" && localJob.dataset_id) {
+    await syncDatasetProcessingResult(env, localJob, runpodJob, status, progress);
+    return;
+  }
+
   if (localJob.type !== "lora_training" || !localJob.lora_id) return;
 
   if (status === "completed") {
@@ -399,6 +457,41 @@ async function syncRunPodJob(env, localJob, runpodJob) {
   } else {
     await env.DB.prepare("UPDATE loras SET status = ?, progress = ?, updated_at = ? WHERE id = ?")
       .bind("training", progress, nowIso(), localJob.lora_id)
+      .run();
+  }
+}
+
+async function syncDatasetProcessingResult(env, localJob, runpodJob, status, progress) {
+  if (status === "completed") {
+    const result = runpodJob.result || {};
+    const faces = Array.isArray(result.faces) ? result.faces : [];
+    for (const face of faces) {
+      await env.DB.prepare(
+        "INSERT OR REPLACE INTO faces (id, dataset_id, status, caption, object_key, https_url, crop_size, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      )
+        .bind(
+          face.id || id("face"),
+          localJob.dataset_id,
+          face.status || "approved",
+          face.caption || "",
+          face.objectKey || face.key || "",
+          face.httpsUrl,
+          Number(face.cropSize || result.cropSize || 1024),
+          nowIso(),
+          nowIso()
+        )
+        .run();
+    }
+    await env.DB.prepare("UPDATE datasets SET status = ?, updated_at = ? WHERE id = ?")
+      .bind(faces.length ? "ready_for_training" : "needs_more_photos", nowIso(), localJob.dataset_id)
+      .run();
+  } else if (status === "failed") {
+    await env.DB.prepare("UPDATE datasets SET status = ?, updated_at = ? WHERE id = ?")
+      .bind("failed", nowIso(), localJob.dataset_id)
+      .run();
+  } else {
+    await env.DB.prepare("UPDATE datasets SET status = ?, updated_at = ? WHERE id = ?")
+      .bind("processing", nowIso(), localJob.dataset_id)
       .run();
   }
 }
