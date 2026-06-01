@@ -13,7 +13,7 @@ from typing import Any
 import boto3
 import requests
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageOps
 from pydantic import BaseModel, Field
 
 
@@ -32,7 +32,7 @@ R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 PUBLIC_STORAGE_BASE_URL = os.environ.get("PUBLIC_STORAGE_BASE_URL", "https://img.xellsun.com").rstrip("/")
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 
 app = FastAPI(title="Face LoRA RunPod Worker", version=APP_VERSION)
 
@@ -108,6 +108,7 @@ def health():
         "datasetProcessing": {
             "visionProvider": "openrouter",
             "visionModel": OPENROUTER_MODEL,
+            "cropPolicy": "square_face_crop_no_stretch",
             "openRouterConfigured": bool(OPENROUTER_API_KEY),
             "r2Configured": bool(R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY),
         },
@@ -264,7 +265,8 @@ def process_dataset(job_id: str, payload: DatasetJobRequest):
 def download_image(url: str) -> Image.Image:
     response = requests.get(url, timeout=60)
     response.raise_for_status()
-    return Image.open(BytesIO(response.content)).convert("RGB")
+    image = Image.open(BytesIO(response.content))
+    return ImageOps.exif_transpose(image).convert("RGB")
 
 
 def analyze_face_with_openrouter(image_url: str, trigger_word: str) -> dict[str, Any]:
@@ -277,7 +279,8 @@ Return JSON only with this shape:
   "caption": "{trigger_word}, close-up portrait, ..."
 }}
 Rules:
-- bbox must cover the main person's face and hair in normalized 0..1 image coordinates.
+- bbox must cover only the main person's face, chin, forehead, ears, and hair in normalized 0..1 image coordinates.
+- Do not include torso, shoulders, hands, watermarks, captions, or background text in bbox.
 - If there is no clear single face, set usable=false and explain reason.
 - Caption should be concise visual training text and must not include names or identity claims.
 - Include the trigger word exactly once in the caption: {trigger_word}
@@ -326,18 +329,18 @@ def crop_face(image: Image.Image, bbox: Any, crop_size: int) -> Image.Image:
     width, height = image.size
     if not isinstance(bbox, dict):
         raise RuntimeError("Gemini did not return a valid bbox")
-    x = float(bbox.get("x", 0))
-    y = float(bbox.get("y", 0))
-    w = float(bbox.get("width", 1))
-    h = float(bbox.get("height", 1))
+    x = clamp(float(bbox.get("x", 0)), 0, 1)
+    y = clamp(float(bbox.get("y", 0)), 0, 1)
+    w = clamp(float(bbox.get("width", 1)), 0.05, 1)
+    h = clamp(float(bbox.get("height", 1)), 0.05, 1)
     left = x * width
     top = y * height
-    right = (x + w) * width
-    bottom = (y + h) * height
+    right = clamp((x + w) * width, left + 1, width)
+    bottom = clamp((y + h) * height, top + 1, height)
     cx = (left + right) / 2
     cy = (top + bottom) / 2
-    side = max(right - left, bottom - top) * 1.85
-    side = min(max(side, min(width, height) * 0.35), max(width, height))
+    side = max(right - left, bottom - top) * 1.45
+    side = min(max(side, min(width, height) * 0.28), min(width, height))
     left = max(0, cx - side / 2)
     top = max(0, cy - side * 0.46)
     right = min(width, left + side)
@@ -346,6 +349,10 @@ def crop_face(image: Image.Image, bbox: Any, crop_size: int) -> Image.Image:
     top = max(0, bottom - side)
     cropped = image.crop((int(left), int(top), int(right), int(bottom)))
     return cropped.resize((crop_size, crop_size), Image.Resampling.LANCZOS)
+
+
+def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
 
 
 def upload_file_to_r2(path: Path, key: str, content_type: str) -> str:
