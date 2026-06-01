@@ -41,6 +41,8 @@ export default {
 };
 
 async function getState(env) {
+  await syncRunPodJobs(env);
+
   const [datasets, faces, jobs, loras, generationTasks] = await Promise.all([
     all(env, "SELECT * FROM datasets ORDER BY created_at DESC LIMIT 50"),
     all(env, "SELECT * FROM faces ORDER BY created_at DESC LIMIT 300"),
@@ -193,16 +195,52 @@ async function createTrainingJob(request, env) {
   await env.DB.prepare(
     "INSERT INTO loras (id, user_id, dataset_id, name, trigger_word, base_model, status, progress, model_path, parameters, created_at, updated_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   )
-    .bind(loraId, USER_ID, body.datasetId, body.loraName, body.triggerWord, body.baseModel || Z_IMAGE_BASE_MODEL, "ready", 100, modelPath, JSON.stringify(parameters), now, now, now)
+    .bind(loraId, USER_ID, body.datasetId, body.loraName, body.triggerWord, body.baseModel || Z_IMAGE_BASE_MODEL, "training", 0, modelPath, JSON.stringify(parameters), now, now, null)
     .run();
+
+  let runpodJob;
+  try {
+    runpodJob = await callRunPod(env, "/jobs/train", {
+      datasetId: body.datasetId,
+      loraId,
+      userId: USER_ID,
+      loraName: body.loraName,
+      triggerWord: body.triggerWord,
+      baseModel: body.baseModel || Z_IMAGE_BASE_MODEL,
+      parameters
+    });
+  } catch (error) {
+    await env.DB.prepare("UPDATE loras SET status = ?, progress = ?, updated_at = ? WHERE id = ?")
+      .bind("failed", 0, nowIso(), loraId)
+      .run();
+    const failedJob = await insertJob(env, {
+      type: "lora_training",
+      status: "failed",
+      progress: 0,
+      datasetId: body.datasetId,
+      loraId,
+      message: `RunPod training request failed: ${error.message}`,
+      payload: {
+        baseModel: Z_IMAGE_BASE_MODEL,
+        modelRepo: Z_IMAGE_REPO
+      }
+    });
+    return { loraId, job: failedJob };
+  }
 
   const job = await insertJob(env, {
     type: "lora_training",
-    status: "completed",
-    progress: 100,
+    status: runpodJob.status || "queued",
+    progress: Number(runpodJob.progress || 0),
     datasetId: body.datasetId,
     loraId,
-    message: "Z-Image Base LoRA record created. Replace this mock step with RunPod AI Toolkit call."
+    message: runpodJob.message || "Z-Image Base training queued on RunPod",
+    payload: {
+      runpodJobId: runpodJob.id,
+      runpodType: runpodJob.type,
+      baseModel: Z_IMAGE_BASE_MODEL,
+      modelRepo: Z_IMAGE_REPO
+    }
   });
 
   return { loraId, job };
@@ -293,6 +331,95 @@ async function insertJob(env, input) {
     .run();
 
   return job;
+}
+
+async function syncRunPodJobs(env) {
+  if (!env.RUNPOD_WORKER_BASE_URL) return;
+  const candidates = await all(
+    env,
+    "SELECT * FROM jobs WHERE status IN ('queued', 'preparing', 'running') AND payload IS NOT NULL ORDER BY updated_at DESC LIMIT 10"
+  );
+
+  for (const job of candidates) {
+    const payload = parseJson(job.payload, {});
+    if (!payload.runpodJobId) continue;
+    try {
+      const runpodJob = await getRunPodJob(env, payload.runpodJobId);
+      await syncRunPodJob(env, job, runpodJob);
+    } catch (error) {
+      const logs = parseJson(job.logs, []);
+      logs.push({ at: nowIso(), message: `RunPod sync failed: ${error.message}` });
+      await env.DB.prepare("UPDATE jobs SET message = ?, logs = ?, updated_at = ? WHERE id = ?")
+        .bind(`RunPod sync failed: ${error.message}`, JSON.stringify(logs), nowIso(), job.id)
+        .run();
+    }
+  }
+}
+
+async function syncRunPodJob(env, localJob, runpodJob) {
+  const logs = Array.isArray(runpodJob.logs) ? runpodJob.logs : parseJson(localJob.logs, []);
+  const status = normalizeRunPodStatus(runpodJob.status);
+  const progress = Number(runpodJob.progress || 0);
+  const message = runpodJob.message || localJob.message || "";
+
+  await env.DB.prepare("UPDATE jobs SET status = ?, progress = ?, message = ?, logs = ?, updated_at = ? WHERE id = ?")
+    .bind(status, progress, message, JSON.stringify(logs), nowIso(), localJob.id)
+    .run();
+
+  if (localJob.type !== "lora_training" || !localJob.lora_id) return;
+
+  if (status === "completed") {
+    const modelPath = runpodJob.result?.modelPath || `${env.RUNPOD_WORKSPACE || "/workspace"}/ComfyUI/models/loras/${USER_ID}/${localJob.lora_id}.safetensors`;
+    await env.DB.prepare("UPDATE loras SET status = ?, progress = ?, model_path = ?, updated_at = ?, completed_at = ? WHERE id = ?")
+      .bind("ready", 100, modelPath, nowIso(), nowIso(), localJob.lora_id)
+      .run();
+  } else if (status === "failed") {
+    await env.DB.prepare("UPDATE loras SET status = ?, progress = ?, updated_at = ? WHERE id = ?")
+      .bind("failed", progress, nowIso(), localJob.lora_id)
+      .run();
+  } else {
+    await env.DB.prepare("UPDATE loras SET status = ?, progress = ?, updated_at = ? WHERE id = ?")
+      .bind("training", progress, nowIso(), localJob.lora_id)
+      .run();
+  }
+}
+
+async function callRunPod(env, path, body) {
+  const baseUrl = (env.RUNPOD_WORKER_BASE_URL || "").replace(/\/$/, "");
+  if (!baseUrl) throw new Error("RUNPOD_WORKER_BASE_URL is not configured");
+  const response = await fetch(`${baseUrl}${path}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...workerAuthHeaders(env)
+    },
+    body: JSON.stringify(body)
+  });
+  return readRunPodResponse(response);
+}
+
+async function getRunPodJob(env, runpodJobId) {
+  const baseUrl = (env.RUNPOD_WORKER_BASE_URL || "").replace(/\/$/, "");
+  if (!baseUrl) throw new Error("RUNPOD_WORKER_BASE_URL is not configured");
+  const response = await fetch(`${baseUrl}/jobs/${runpodJobId}`, {
+    headers: workerAuthHeaders(env)
+  });
+  return readRunPodResponse(response);
+}
+
+async function readRunPodResponse(response) {
+  const text = await response.text();
+  const body = parseJson(text, text);
+  if (!response.ok) {
+    const detail = typeof body === "object" ? body.detail || body.error || JSON.stringify(body) : body;
+    throw new Error(`RunPod ${response.status}: ${detail}`);
+  }
+  return body;
+}
+
+function normalizeRunPodStatus(status) {
+  if (["queued", "preparing", "running", "completed", "failed"].includes(status)) return status;
+  return status || "running";
 }
 
 async function all(env, sql) {
