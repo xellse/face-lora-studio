@@ -178,6 +178,8 @@ async function createTrainingJob(request, env) {
   const now = nowIso();
   const loraId = id("lora");
   const modelPath = `${env.RUNPOD_WORKSPACE || "/workspace"}/ComfyUI/models/loras/${USER_ID}/${loraId}.safetensors`;
+  const datasetImages = await getApprovedDatasetImages(env, body.datasetId);
+  if (!datasetImages.length) throw new Error("Dataset has no approved training images");
   const parameters = {
     steps: Number(body.steps || 3000),
     learningRate: body.learningRate || "1e-4",
@@ -207,7 +209,8 @@ async function createTrainingJob(request, env) {
       loraName: body.loraName,
       triggerWord: body.triggerWord,
       baseModel: body.baseModel || Z_IMAGE_BASE_MODEL,
-      parameters
+      parameters,
+      datasetImages
     });
   } catch (error) {
     await env.DB.prepare("UPDATE loras SET status = ?, progress = ?, updated_at = ? WHERE id = ?")
@@ -331,6 +334,22 @@ async function insertJob(env, input) {
     .run();
 
   return job;
+}
+
+async function getApprovedDatasetImages(env, datasetId) {
+  const rows = await env.DB.prepare(
+    "SELECT id, caption, https_url, crop_size FROM faces WHERE dataset_id = ? AND status = ? ORDER BY created_at ASC"
+  )
+    .bind(datasetId, "approved")
+    .all();
+
+  return (rows.results || []).map((face, index) => ({
+    id: face.id,
+    index,
+    url: face.https_url,
+    caption: face.caption,
+    cropSize: face.crop_size
+  }));
 }
 
 async function syncRunPodJobs(env) {

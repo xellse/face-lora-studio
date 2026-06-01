@@ -2,11 +2,11 @@
 
 This worker runs inside the RunPod persistent Pod on port `4000`.
 
-For the first deployment it provides:
+It provides:
 
 - `GET /health` for Cloudflare and manual checks
 - `POST /jobs/dataset` placeholder for face crop + caption
-- `POST /jobs/train` placeholder for AI Toolkit training
+- `POST /jobs/train` downloads dataset images, writes captions, generates an AI Toolkit YAML config, runs `python run.py`, and installs the resulting `.safetensors` into ComfyUI
 - `POST /jobs/generate` placeholder for ComfyUI generation
 - `GET /jobs/{job_id}` for job status
 
@@ -51,3 +51,12 @@ Check through RunPod proxy:
 ```txt
 https://<POD_ID>-4000.proxy.runpod.net/health
 ```
+
+## Training Output
+
+For a training job `rp_xxx`, the worker writes:
+
+- Dataset images and captions: `/workspace/jobs/rp_xxx/dataset/images`
+- AI Toolkit config: `/workspace/jobs/rp_xxx/z_image_base_ai_toolkit_config.yaml`
+- AI Toolkit output: `/workspace/jobs/rp_xxx/ai_toolkit_output`
+- Installed LoRA: `/workspace/ComfyUI/models/loras/local-user/{loraId}.safetensors`

@@ -1,12 +1,17 @@
 import json
 import os
+import re
+import shutil
+import subprocess
 import time
 import uuid
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import requests
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
+from PIL import Image, ImageDraw
 from pydantic import BaseModel, Field
 
 
@@ -16,6 +21,7 @@ COMFY_BASE_URL = os.environ.get("COMFY_BASE_URL", "http://127.0.0.1:8188").rstri
 WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
 Z_IMAGE_BASE_MODEL = "z-image-base"
 Z_IMAGE_REPO = "Tongyi-MAI/Z-Image"
+AI_TOOLKIT_DIR = WORKSPACE / "ai-toolkit"
 
 APP_VERSION = "0.1.0"
 
@@ -38,6 +44,15 @@ class TrainingJobRequest(BaseModel):
     trigger_word: str = Field(alias="triggerWord")
     base_model: str = Field(default=Z_IMAGE_BASE_MODEL, alias="baseModel")
     parameters: dict[str, Any] = Field(default_factory=dict)
+    dataset_images: list["TrainingImage"] = Field(default_factory=list, alias="datasetImages")
+
+
+class TrainingImage(BaseModel):
+    id: str
+    index: int = 0
+    url: str
+    caption: str
+    crop_size: int | None = Field(default=None, alias="cropSize")
 
 
 class GenerationJobRequest(BaseModel):
@@ -166,74 +181,213 @@ def simulate_dataset_processing(job_id: str):
 
 
 def simulate_training(job_id: str, payload: TrainingJobRequest):
-    update_job(job_id, 15, "running", "Preparing AI Toolkit config")
-    time.sleep(1)
-    config_path = write_z_image_training_config(job_id, payload)
-    update_job(job_id, 45, "running", "Z-Image Base AI Toolkit training placeholder", {
-        "aiToolkitConfig": str(config_path),
-    })
-    time.sleep(1)
-    model_path = WORKSPACE / "ComfyUI/models/loras" / payload.user_id / f"{payload.lora_id}.safetensors"
-    model_path.parent.mkdir(parents=True, exist_ok=True)
-    model_path.write_text("placeholder safetensors file; replace with AI Toolkit output\n")
-    update_job(job_id, 100, "completed", "Training placeholder completed", {
-        "modelPath": str(model_path),
-        "baseModel": Z_IMAGE_BASE_MODEL,
-        "modelRepo": Z_IMAGE_REPO,
-    })
+    try:
+        if not payload.dataset_images:
+            raise RuntimeError("No datasetImages were provided for training")
+
+        update_job(job_id, 10, "running", "Downloading training images and captions")
+        dataset_dir = prepare_training_dataset(job_id, payload)
+
+        update_job(job_id, 18, "running", "Writing Z-Image Base AI Toolkit config")
+        config_path = write_z_image_training_config(job_id, payload, dataset_dir)
+
+        update_job(job_id, 25, "running", "Starting AI Toolkit training", {
+            "aiToolkitConfig": str(config_path),
+            "datasetDir": str(dataset_dir),
+        })
+        output_dir = run_ai_toolkit(job_id, config_path)
+
+        update_job(job_id, 96, "running", "Copying trained LoRA into ComfyUI")
+        model_path = install_trained_lora(payload, output_dir)
+        update_job(job_id, 100, "completed", "Z-Image Base LoRA training completed", {
+            "modelPath": str(model_path),
+            "baseModel": Z_IMAGE_BASE_MODEL,
+            "modelRepo": Z_IMAGE_REPO,
+            "aiToolkitOutput": str(output_dir),
+        })
+    except Exception as exc:
+        update_job(job_id, 100, "failed", f"Training failed: {exc}", {
+            "error": str(exc),
+            "baseModel": Z_IMAGE_BASE_MODEL,
+            "modelRepo": Z_IMAGE_REPO,
+        })
 
 
-def write_z_image_training_config(job_id: str, payload: TrainingJobRequest) -> Path:
+def prepare_training_dataset(job_id: str, payload: TrainingJobRequest) -> Path:
+    job_dir = JOBS_DIR / job_id
+    dataset_dir = job_dir / "dataset"
+    images_dir = dataset_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    for index, image in enumerate(payload.dataset_images, start=1):
+        image_path = images_dir / f"{index:04d}.jpg"
+        caption_path = images_dir / f"{index:04d}.txt"
+        download_training_image(image.url, image_path, image.caption)
+        caption_path.write_text(ensure_trigger_word(image.caption, payload.trigger_word))
+
+    return images_dir
+
+
+def download_training_image(url: str, image_path: Path, caption: str):
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    content_type = response.headers.get("content-type", "")
+    try:
+        image = Image.open(BytesIO(response.content)).convert("RGB")
+    except Exception:
+        image = Image.new("RGB", (1024, 1024), color=(38, 98, 108))
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((332, 210, 692, 570), fill=(245, 245, 245))
+        draw.rounded_rectangle((300, 650, 724, 880), radius=90, fill=(245, 245, 245))
+        draw.text((48, 940), f"placeholder for unsupported {content_type}", fill=(255, 255, 255))
+        draw.text((48, 970), caption[:80], fill=(255, 255, 255))
+    image.save(image_path, "JPEG", quality=95)
+
+
+def ensure_trigger_word(caption: str, trigger_word: str) -> str:
+    caption = (caption or "").strip()
+    if trigger_word and trigger_word not in caption:
+        return f"{trigger_word}, {caption}" if caption else trigger_word
+    return caption
+
+
+def write_z_image_training_config(job_id: str, payload: TrainingJobRequest, images_dir: Path) -> Path:
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     parameters = z_image_training_parameters(payload.parameters)
-    config = {
-        "job": f"train_{payload.lora_id}",
-        "model": {
-            "architecture": "z-image",
-            "name_or_path": Z_IMAGE_REPO,
-            "base_model": Z_IMAGE_BASE_MODEL,
-            "low_vram": False,
-        },
-        "target": {
-            "type": "lora",
-            "linear_rank": parameters["rank"],
-            "linear_alpha": parameters["rank"],
-        },
-        "save": {
-            "dtype": "bf16",
-            "save_every": parameters["saveEvery"],
-            "max_step_saves_to_keep": 4,
-            "output_path": str(WORKSPACE / "ComfyUI/models/loras" / payload.user_id / f"{payload.lora_id}.safetensors"),
-        },
-        "training": {
-            "steps": parameters["steps"],
-            "learning_rate": parameters["learningRate"],
-            "batch_size": 1,
-            "gradient_accumulation": 1,
-            "optimizer": "AdamW8Bit",
-            "weight_decay": 0.0001,
-            "precision": "bf16",
-            "timestep_type": "weighted",
-            "timestep_bias": "balanced",
-            "loss_type": "mse",
-        },
-        "dataset": {
-            "dataset_id": payload.dataset_id,
-            "resolution": parameters["resolution"],
-            "repeats": parameters["repeats"],
-            "caption_ext": "txt",
-            "trigger_word": payload.trigger_word,
-        },
-        "sample": {
-            "steps": 40,
-            "cfg": 5,
-            "lora_scale": 0.85,
-        },
-    }
-    config_path = job_dir / "z_image_base_ai_toolkit_config.json"
-    config_path.write_text(json.dumps(config, indent=2))
+    config_path = job_dir / "z_image_base_ai_toolkit_config.yaml"
+    output_dir = job_dir / "ai_toolkit_output"
+    safe_name = safe_job_name(payload.lora_id)
+    config_path.write_text(f"""---
+job: extension
+config:
+  name: "{safe_name}"
+  process:
+    - type: "sd_trainer"
+      training_folder: "{output_dir}"
+      device: cuda:0
+      trigger_word: "{yaml_escape(payload.trigger_word)}"
+      network:
+        type: "lora"
+        linear: {parameters["rank"]}
+        linear_alpha: {parameters["rank"]}
+      save:
+        dtype: float16
+        save_every: {parameters["saveEvery"]}
+        max_step_saves_to_keep: 4
+        push_to_hub: false
+      datasets:
+        - folder_path: "{images_dir}"
+          caption_ext: "txt"
+          caption_dropout_rate: 0.05
+          shuffle_tokens: false
+          cache_latents_to_disk: true
+          resolution: [ {parameters["resolution"]} ]
+      train:
+        batch_size: 1
+        cache_text_embeddings: true
+        steps: {parameters["steps"]}
+        gradient_accumulation: 1
+        train_unet: true
+        train_text_encoder: false
+        gradient_checkpointing: true
+        noise_scheduler: "flowmatch"
+        optimizer: "adamw8bit"
+        lr: {parameters["learningRate"]}
+        dtype: bf16
+      model:
+        name_or_path: "{Z_IMAGE_REPO}"
+        arch: "z_image"
+        quantize: true
+        low_vram: false
+      sample:
+        sampler: "flowmatch"
+        sample_every: {parameters["saveEvery"]}
+        width: {parameters["resolution"]}
+        height: {parameters["resolution"]}
+        prompts:
+          - "[trigger], close-up portrait, natural light, sharp facial detail"
+        neg: ""
+        seed: 42
+        walk_seed: true
+        guidance_scale: 5
+        sample_steps: 40
+meta:
+  name: "[name]"
+  version: "1.0"
+""")
     return config_path
+
+
+def run_ai_toolkit(job_id: str, config_path: Path) -> Path:
+    if not (AI_TOOLKIT_DIR / "run.py").exists():
+        raise RuntimeError(f"AI Toolkit run.py not found at {AI_TOOLKIT_DIR}")
+
+    command = ["python", "run.py", str(config_path)]
+    process = subprocess.Popen(
+        command,
+        cwd=AI_TOOLKIT_DIR,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    progress = 25
+    assert process.stdout is not None
+    for line in process.stdout:
+        clean = line.rstrip()
+        if not clean:
+            continue
+        progress = max(progress, infer_training_progress(clean, progress))
+        append_job_log(job_id, clean, progress=progress, status="running")
+
+    exit_code = process.wait()
+    if exit_code != 0:
+        raise RuntimeError(f"AI Toolkit exited with code {exit_code}")
+
+    job = read_job(job_id)
+    config_payload = job.get("result") if job else None
+    output_hint = None
+    if isinstance(config_payload, dict):
+        output_hint = config_payload.get("aiToolkitConfig")
+    return config_path.parent / "ai_toolkit_output"
+
+
+def infer_training_progress(line: str, current: int) -> int:
+    match = re.search(r"(\d+)\s*/\s*(\d+)", line)
+    if match:
+        step = int(match.group(1))
+        total = max(1, int(match.group(2)))
+        return min(95, max(current, 25 + int((step / total) * 70)))
+    if "saving" in line.lower():
+        return max(current, 90)
+    return current
+
+
+def append_job_log(job_id: str, message: str, progress: int | None = None, status: str | None = None):
+    job = read_job(job_id)
+    if not job:
+        return
+    job["logs"].append({"at": now_iso(), "message": message[-1000:]})
+    job["logs"] = job["logs"][-200:]
+    if progress is not None:
+        job["progress"] = progress
+    if status is not None:
+        job["status"] = status
+    job["message"] = message[-240:]
+    job["updatedAt"] = now_iso()
+    write_job(job)
+
+
+def install_trained_lora(payload: TrainingJobRequest, output_dir: Path) -> Path:
+    candidates = sorted(output_dir.rglob("*.safetensors"), key=lambda path: path.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise RuntimeError(f"No safetensors output found under {output_dir}")
+    destination = WORKSPACE / "ComfyUI/models/loras" / payload.user_id / f"{payload.lora_id}.safetensors"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(candidates[0], destination)
+    return destination
 
 
 def z_image_training_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
@@ -245,6 +399,14 @@ def z_image_training_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
         "resolution": int(parameters.get("resolution", 1024)),
         "saveEvery": int(parameters.get("saveEvery", 250)),
     }
+
+
+def safe_job_name(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]+", "_", value).strip("_") or f"job_{uuid.uuid4().hex[:8]}"
+
+
+def yaml_escape(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
 
 def simulate_generation(job_id: str):
