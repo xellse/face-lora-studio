@@ -32,7 +32,7 @@ R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 PUBLIC_STORAGE_BASE_URL = os.environ.get("PUBLIC_STORAGE_BASE_URL", "https://img.xellsun.com").rstrip("/")
 
-APP_VERSION = "0.1.1"
+APP_VERSION = "0.1.2"
 
 app = FastAPI(title="Face LoRA RunPod Worker", version=APP_VERSION)
 
@@ -108,7 +108,7 @@ def health():
         "datasetProcessing": {
             "visionProvider": "openrouter",
             "visionModel": OPENROUTER_MODEL,
-            "cropPolicy": "square_face_crop_no_stretch",
+            "cropPolicy": "face_only_square_crop_no_stretch",
             "openRouterConfigured": bool(OPENROUTER_API_KEY),
             "r2Configured": bool(R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY),
         },
@@ -230,7 +230,16 @@ def process_dataset(job_id: str, payload: DatasetJobRequest):
                 })
                 continue
 
-            crop = crop_face(source_image, analysis.get("bbox"), payload.crop_size)
+            try:
+                crop = crop_face(source_image, analysis, payload.crop_size)
+            except Exception as exc:
+                review_items.append({
+                    "id": raw.id,
+                    "reason": f"Face crop rejected: {exc}",
+                    "sourceUrl": raw.url,
+                    "analysis": analysis,
+                })
+                continue
             face_id = f"face_{uuid.uuid4().hex[:8]}"
             face_path = faces_dir / f"{face_id}.jpg"
             crop.save(face_path, "JPEG", quality=95)
@@ -270,18 +279,24 @@ def download_image(url: str) -> Image.Image:
 
 
 def analyze_face_with_openrouter(image_url: str, trigger_word: str) -> dict[str, Any]:
-    prompt = f"""Analyze this portrait training image for LoRA preparation.
+    prompt = f"""Analyze this image for FACE LoRA training preparation.
 Return JSON only with this shape:
 {{
   "usable": true,
   "reason": "",
-  "bbox": {{"x": 0.25, "y": 0.12, "width": 0.5, "height": 0.58}},
+  "bboxTarget": "face_only",
+  "containsBodyInBbox": false,
+  "bbox": {{"x": 0.25, "y": 0.12, "width": 0.5, "height": 0.42}},
   "caption": "{trigger_word}, close-up portrait, ..."
 }}
 Rules:
-- bbox must cover only the main person's face, chin, forehead, ears, and hair in normalized 0..1 image coordinates.
-- Do not include torso, shoulders, hands, watermarks, captions, or background text in bbox.
-- If there is no clear single face, set usable=false and explain reason.
+- The goal is a face LoRA dataset, not a full-body or half-body dataset.
+- bbox is a tight FACE/HEAD detection box before crop margin.
+- bbox must cover the main person's visible face, chin, forehead, ears, and hair only.
+- bbox must exclude shoulders, torso, arms, hands, clothing below the neck, watermarks, captions, and background text.
+- If the original photo is full-body or half-body, still return a tight bbox around the face/head only.
+- Set containsBodyInBbox=true if your bbox includes shoulders, torso, hands, or significant clothing below the neck.
+- If the face is too small, too blurry, occluded, or there is no clear single main face, set usable=false and explain reason.
 - Caption should be concise visual training text and must not include names or identity claims.
 - Include the trigger word exactly once in the caption: {trigger_word}
 """
@@ -325,33 +340,61 @@ def parse_json_object(content: Any) -> dict[str, Any]:
     return json.loads(text)
 
 
-def crop_face(image: Image.Image, bbox: Any, crop_size: int) -> Image.Image:
+def crop_face(image: Image.Image, analysis: dict[str, Any], crop_size: int) -> Image.Image:
     width, height = image.size
+    bbox = analysis.get("bbox")
     if not isinstance(bbox, dict):
         raise RuntimeError("Gemini did not return a valid bbox")
+    if analysis.get("containsBodyInBbox") is True:
+        raise RuntimeError("Gemini bbox includes body/shoulders instead of face only")
     x = clamp(float(bbox.get("x", 0)), 0, 1)
     y = clamp(float(bbox.get("y", 0)), 0, 1)
     w = clamp(float(bbox.get("width", 1)), 0.05, 1)
     h = clamp(float(bbox.get("height", 1)), 0.05, 1)
+    validate_face_bbox(x, y, w, h)
     left = x * width
     top = y * height
     right = clamp((x + w) * width, left + 1, width)
     bottom = clamp((y + h) * height, top + 1, height)
     cx = (left + right) / 2
     cy = (top + bottom) / 2
-    side = max(right - left, bottom - top) * 1.45
-    side = min(max(side, min(width, height) * 0.28), min(width, height))
-    left = max(0, cx - side / 2)
-    top = max(0, cy - side * 0.46)
-    right = min(width, left + side)
-    bottom = min(height, top + side)
-    left = max(0, right - side)
-    top = max(0, bottom - side)
-    cropped = image.crop((int(left), int(top), int(right), int(bottom)))
+
+    face_width = right - left
+    face_height = bottom - top
+    side = max(face_width * 1.38, face_height * 1.28)
+    side = min(max(side, max(face_width, face_height) * 1.12), min(width, height))
+    side_px = max(2, int(round(side)))
+
+    # Keep the face slightly high in the final square so chin is included without drifting into shoulders.
+    crop_left = int(round(cx - side_px / 2))
+    crop_top = int(round(cy - side_px * 0.50))
+    crop_left = clamp_int(crop_left, 0, width - side_px)
+    crop_top = clamp_int(crop_top, 0, height - side_px)
+    crop_box = (crop_left, crop_top, crop_left + side_px, crop_top + side_px)
+    cropped = image.crop(crop_box)
+    if cropped.width != cropped.height:
+        raise RuntimeError(f"Internal crop box was not square: {cropped.width}x{cropped.height}")
     return cropped.resize((crop_size, crop_size), Image.Resampling.LANCZOS)
 
 
+def validate_face_bbox(x: float, y: float, width: float, height: float):
+    area = width * height
+    bottom = y + height
+    if width > 0.82 and height > 0.82:
+        raise RuntimeError("bbox covers almost the whole image, not a face-only crop")
+    if height > 0.72 and bottom > 0.92 and y > 0.04:
+        raise RuntimeError("bbox looks like upper-body/full-body framing, not face-only")
+    if area > 0.62 and y > 0.04:
+        raise RuntimeError("bbox area is too large for face-only training")
+
+
 def clamp(value: float, minimum: float, maximum: float) -> float:
+    return max(minimum, min(maximum, value))
+
+
+def clamp_int(value: int, minimum: int, maximum: int) -> int:
+    if maximum < minimum:
+        return minimum
     return max(minimum, min(maximum, value))
 
 
