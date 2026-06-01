@@ -121,7 +121,7 @@ function uploadView(data) {
 }
 
 function reviewView(data) {
-  const latest = [...data.datasets].reverse()[0];
+  const latest = data.datasets[0];
   if (!latest) return emptyPanel("样本预览", "还没有数据集");
   return `
     <section class="grid">
@@ -242,14 +242,14 @@ function generateView(data) {
         <div class="panel-head">
           <h2 class="panel-title">最近任务</h2>
         </div>
-        <div class="panel-body">${taskList(data.generationTasks.slice(-4).reverse())}</div>
+        <div class="panel-body">${taskList(data.generationTasks.slice(0, 4))}</div>
       </section>
     </section>
   `;
 }
 
 function galleryView(data) {
-  const tasks = [...data.generationTasks].reverse();
+  const tasks = data.generationTasks;
   return `
     <section class="grid">
       ${tasks.map((task) => galleryTask(task)).join("") || emptyPanel("任务文件夹", "还没有生成任务")}
@@ -289,7 +289,7 @@ function galleryTask(task) {
 }
 
 function jobList(jobs) {
-  const recent = [...jobs].reverse().slice(0, 8);
+  const recent = jobs.slice(0, 8);
   return `<div class="job-list">${recent.map((job) => `
     <article class="item">
       <div class="split">
@@ -303,7 +303,7 @@ function jobList(jobs) {
 }
 
 function loraList(loras) {
-  return `<div class="lora-list">${[...loras].reverse().map((lora) => `
+  return `<div class="lora-list">${loras.map((lora) => `
     <article class="item">
       <div class="split">
         <strong>${escapeHtml(lora.name)}</strong>
