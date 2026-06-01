@@ -14,6 +14,8 @@ WORKSPACE = Path(os.environ.get("RUNPOD_WORKSPACE", "/workspace"))
 JOBS_DIR = WORKSPACE / "jobs"
 COMFY_BASE_URL = os.environ.get("COMFY_BASE_URL", "http://127.0.0.1:8188").rstrip("/")
 WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
+Z_IMAGE_BASE_MODEL = "z-image-base"
+Z_IMAGE_REPO = "Tongyi-MAI/Z-Image"
 
 APP_VERSION = "0.1.0"
 
@@ -34,7 +36,7 @@ class TrainingJobRequest(BaseModel):
     user_id: str = Field(default="local-user", alias="userId")
     lora_name: str = Field(alias="loraName")
     trigger_word: str = Field(alias="triggerWord")
-    base_model: str = Field(default="sdxl", alias="baseModel")
+    base_model: str = Field(default=Z_IMAGE_BASE_MODEL, alias="baseModel")
     parameters: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -63,6 +65,11 @@ def health():
     return {
         "ok": True,
         "version": APP_VERSION,
+        "defaultModel": {
+            "id": Z_IMAGE_BASE_MODEL,
+            "architecture": "z-image",
+            "repo": Z_IMAGE_REPO,
+        },
         "workspace": str(WORKSPACE),
         "paths": {
             "jobs": str(JOBS_DIR),
@@ -161,14 +168,83 @@ def simulate_dataset_processing(job_id: str):
 def simulate_training(job_id: str, payload: TrainingJobRequest):
     update_job(job_id, 15, "running", "Preparing AI Toolkit config")
     time.sleep(1)
-    update_job(job_id, 45, "running", "AI Toolkit training placeholder")
+    config_path = write_z_image_training_config(job_id, payload)
+    update_job(job_id, 45, "running", "Z-Image Base AI Toolkit training placeholder", {
+        "aiToolkitConfig": str(config_path),
+    })
     time.sleep(1)
     model_path = WORKSPACE / "ComfyUI/models/loras" / payload.user_id / f"{payload.lora_id}.safetensors"
     model_path.parent.mkdir(parents=True, exist_ok=True)
     model_path.write_text("placeholder safetensors file; replace with AI Toolkit output\n")
     update_job(job_id, 100, "completed", "Training placeholder completed", {
         "modelPath": str(model_path),
+        "baseModel": Z_IMAGE_BASE_MODEL,
+        "modelRepo": Z_IMAGE_REPO,
     })
+
+
+def write_z_image_training_config(job_id: str, payload: TrainingJobRequest) -> Path:
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    parameters = z_image_training_parameters(payload.parameters)
+    config = {
+        "job": f"train_{payload.lora_id}",
+        "model": {
+            "architecture": "z-image",
+            "name_or_path": Z_IMAGE_REPO,
+            "base_model": Z_IMAGE_BASE_MODEL,
+            "low_vram": False,
+        },
+        "target": {
+            "type": "lora",
+            "linear_rank": parameters["rank"],
+            "linear_alpha": parameters["rank"],
+        },
+        "save": {
+            "dtype": "bf16",
+            "save_every": parameters["saveEvery"],
+            "max_step_saves_to_keep": 4,
+            "output_path": str(WORKSPACE / "ComfyUI/models/loras" / payload.user_id / f"{payload.lora_id}.safetensors"),
+        },
+        "training": {
+            "steps": parameters["steps"],
+            "learning_rate": parameters["learningRate"],
+            "batch_size": 1,
+            "gradient_accumulation": 1,
+            "optimizer": "AdamW8Bit",
+            "weight_decay": 0.0001,
+            "precision": "bf16",
+            "timestep_type": "weighted",
+            "timestep_bias": "balanced",
+            "loss_type": "mse",
+        },
+        "dataset": {
+            "dataset_id": payload.dataset_id,
+            "resolution": parameters["resolution"],
+            "repeats": parameters["repeats"],
+            "caption_ext": "txt",
+            "trigger_word": payload.trigger_word,
+        },
+        "sample": {
+            "steps": 40,
+            "cfg": 5,
+            "lora_scale": 0.85,
+        },
+    }
+    config_path = job_dir / "z_image_base_ai_toolkit_config.json"
+    config_path.write_text(json.dumps(config, indent=2))
+    return config_path
+
+
+def z_image_training_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "steps": int(parameters.get("steps", 3000)),
+        "learningRate": parameters.get("learningRate", "1e-4"),
+        "rank": int(parameters.get("rank", 32)),
+        "repeats": int(parameters.get("repeats", 10)),
+        "resolution": int(parameters.get("resolution", 1024)),
+        "saveEvery": int(parameters.get("saveEvery", 250)),
+    }
 
 
 def simulate_generation(job_id: str):

@@ -22,8 +22,8 @@ export function startGeneration({ payload, storage }) {
       width: Number(payload.width || 1024),
       height: Number(payload.height || 1024),
       seed: payload.seed ? Number(payload.seed) : Math.floor(Math.random() * 2_000_000_000),
-      steps: Number(payload.steps || 28),
-      cfg: Number(payload.cfg || 4.5),
+      steps: Number(payload.steps || 40),
+      cfg: Number(payload.cfg || 5),
       sampler: payload.sampler || "euler",
       loraWeight: Number(payload.loraWeight || 0.85)
     },

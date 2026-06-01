@@ -28,10 +28,10 @@ async function main() {
     datasetId: dataset.id,
     loraName: "Smoke LoRA",
     triggerWord: "smoke_person",
-    baseModel: "flux-dev",
-    steps: 300,
+    baseModel: "z-image-base",
+    steps: 1000,
     learningRate: "1e-4",
-    rank: 16,
+    rank: 32,
     repeats: 10,
     resolution: 1024,
     saveEvery: 150
@@ -50,8 +50,8 @@ async function main() {
     count: 2,
     width: 768,
     height: 768,
-    steps: 18,
-    cfg: 4.5,
+    steps: 40,
+    cfg: 5,
     sampler: "euler",
     loraWeight: 0.85
   });

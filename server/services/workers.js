@@ -116,12 +116,16 @@ export function startTraining({ payload }) {
     createdAt: nowIso(),
     updatedAt: nowIso(),
     parameters: {
-      steps: Number(payload.steps || 1200),
+      steps: Number(payload.steps || 3000),
       learningRate: payload.learningRate || "1e-4",
-      rank: Number(payload.rank || 16),
+      rank: Number(payload.rank || 32),
       repeats: Number(payload.repeats || 10),
       resolution: Number(payload.resolution || 1024),
-      saveEvery: Number(payload.saveEvery || 250)
+      saveEvery: Number(payload.saveEvery || 250),
+      architecture: "z-image",
+      modelRepo: "Tongyi-MAI/Z-Image",
+      precision: "bf16",
+      optimizer: "AdamW8Bit"
     }
   });
 

@@ -40,7 +40,7 @@ Recommended RunPod paths are encoded in generated jobs:
 
 ## Product defaults
 
-- base model: Flux Dev
+- base model: Z-Image Base (`Tongyi-MAI/Z-Image`)
 - crop size: 1024
 - storage: S3/R2-style public HTTPS URLs
 - user mode: single internal user named `local-user`

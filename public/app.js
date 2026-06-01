@@ -181,13 +181,12 @@ function trainView(data) {
             <label>触发词<input name="triggerWord" value="${readyDatasets[0]?.triggerWord || "person_lora"}" required /></label>
             <label>基础模型
               <select name="baseModel">
-                <option value="flux-dev">Flux Dev</option>
-                <option value="sdxl">SDXL</option>
+                <option value="z-image-base" selected>Z-Image Base</option>
               </select>
             </label>
-            <label>训练步数<input name="steps" type="number" value="1200" min="100" step="50" /></label>
+            <label>训练步数<input name="steps" type="number" value="3000" min="1000" step="100" /></label>
             <label>学习率<input name="learningRate" value="1e-4" /></label>
-            <label>Rank<input name="rank" type="number" value="16" min="4" max="128" /></label>
+            <label>Rank<input name="rank" type="number" value="32" min="16" max="128" /></label>
             <label>图片重复<input name="repeats" type="number" value="10" min="1" max="50" /></label>
             <label>训练分辨率<input name="resolution" type="number" value="1024" min="512" max="1536" step="128" /></label>
             <label>保存间隔<input name="saveEvery" type="number" value="250" min="50" step="50" /></label>
@@ -225,8 +224,8 @@ function generateView(data) {
             <label>宽度<input name="width" type="number" value="1024" min="512" max="1536" step="64" /></label>
             <label>高度<input name="height" type="number" value="1024" min="512" max="1536" step="64" /></label>
             <label>Seed<input name="seed" type="number" placeholder="random" /></label>
-            <label>Steps<input name="steps" type="number" value="28" min="8" max="80" /></label>
-            <label>CFG<input name="cfg" type="number" value="4.5" min="1" max="12" step="0.1" /></label>
+            <label>Steps<input name="steps" type="number" value="40" min="20" max="80" /></label>
+            <label>CFG<input name="cfg" type="number" value="5" min="1" max="12" step="0.1" /></label>
             <label>Sampler
               <select name="sampler">
                 <option value="euler">euler</option>

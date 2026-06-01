@@ -12,6 +12,16 @@ For the first deployment it provides:
 
 The service is intentionally separate from ComfyUI. Cloudflare should call this worker, and this worker should call local ComfyUI at `http://127.0.0.1:8188`.
 
+Training defaults are set for Z-Image Base:
+
+- Architecture: `z-image`
+- Base model repo: `Tongyi-MAI/Z-Image`
+- Rank: `32`
+- Learning rate: `1e-4`
+- Resolution: `1024`
+- Steps: `3000`
+- Preview/generation baseline: `40` steps, CFG `5`
+
 ## Run on Pod
 
 ```bash
@@ -41,4 +51,3 @@ Check through RunPod proxy:
 ```txt
 https://<POD_ID>-4000.proxy.runpod.net/health
 ```
-

@@ -1,4 +1,6 @@
 const USER_ID = "local-user";
+const Z_IMAGE_BASE_MODEL = "z-image-base";
+const Z_IMAGE_REPO = "Tongyi-MAI/Z-Image";
 
 export default {
   async fetch(request, env) {
@@ -175,18 +177,23 @@ async function createTrainingJob(request, env) {
   const loraId = id("lora");
   const modelPath = `${env.RUNPOD_WORKSPACE || "/workspace"}/ComfyUI/models/loras/${USER_ID}/${loraId}.safetensors`;
   const parameters = {
-    steps: Number(body.steps || 1200),
+    steps: Number(body.steps || 3000),
     learningRate: body.learningRate || "1e-4",
-    rank: Number(body.rank || 16),
+    rank: Number(body.rank || 32),
     repeats: Number(body.repeats || 10),
     resolution: Number(body.resolution || 1024),
-    saveEvery: Number(body.saveEvery || 250)
+    saveEvery: Number(body.saveEvery || 250),
+    architecture: "z-image",
+    modelRepo: Z_IMAGE_REPO,
+    quantization: "float8",
+    precision: "bf16",
+    optimizer: "AdamW8Bit"
   };
 
   await env.DB.prepare(
     "INSERT INTO loras (id, user_id, dataset_id, name, trigger_word, base_model, status, progress, model_path, parameters, created_at, updated_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   )
-    .bind(loraId, USER_ID, body.datasetId, body.loraName, body.triggerWord, body.baseModel || "sdxl", "ready", 100, modelPath, JSON.stringify(parameters), now, now, now)
+    .bind(loraId, USER_ID, body.datasetId, body.loraName, body.triggerWord, body.baseModel || Z_IMAGE_BASE_MODEL, "ready", 100, modelPath, JSON.stringify(parameters), now, now, now)
     .run();
 
   const job = await insertJob(env, {
@@ -195,7 +202,7 @@ async function createTrainingJob(request, env) {
     progress: 100,
     datasetId: body.datasetId,
     loraId,
-    message: "LoRA record created. Replace this mock step with RunPod AI Toolkit call."
+    message: "Z-Image Base LoRA record created. Replace this mock step with RunPod AI Toolkit call."
   });
 
   return { loraId, job };
@@ -214,8 +221,8 @@ async function createGenerationTask(request, env) {
     width: Number(body.width || 1024),
     height: Number(body.height || 1024),
     seed: body.seed ? Number(body.seed) : Math.floor(Math.random() * 2_000_000_000),
-    steps: Number(body.steps || 28),
-    cfg: Number(body.cfg || 4.5),
+    steps: Number(body.steps || 40),
+    cfg: Number(body.cfg || 5),
     sampler: body.sampler || "euler",
     loraWeight: Number(body.loraWeight || 0.85)
   };
