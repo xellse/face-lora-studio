@@ -2,6 +2,8 @@
 node_modules/
 .data/
 .wrangler/
+__pycache__/
+*.pyc
 .env
 .dev.vars
 worker/wrangler.toml
