@@ -4,32 +4,32 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    if (request.method === "OPTIONS") return corsResponse(env);
+    if (request.method === "OPTIONS") return corsResponse(env, request);
 
     try {
       if (request.method === "GET" && url.pathname === "/api/state") {
-        return json(await getState(env), env);
+        return json(await getState(env), env, 200, request);
       }
 
       if (request.method === "POST" && url.pathname === "/api/uploads") {
-        return json(await uploadObject(request, env), env, 201);
+        return json(await uploadObject(request, env), env, 201, request);
       }
 
       if (request.method === "POST" && url.pathname === "/api/datasets") {
-        return json(await createDataset(request, env), env, 201);
+        return json(await createDataset(request, env), env, 201, request);
       }
 
       if (request.method === "POST" && url.pathname === "/api/training") {
-        return json(await createTrainingJob(request, env), env, 201);
+        return json(await createTrainingJob(request, env), env, 201, request);
       }
 
       if (request.method === "POST" && url.pathname === "/api/generation") {
-        return json(await createGenerationTask(request, env), env, 201);
+        return json(await createGenerationTask(request, env), env, 201, request);
       }
 
-      return json({ error: "Route not found" }, env, 404);
+      return json({ error: "Route not found" }, env, 404, request);
     } catch (error) {
-      return json({ error: error.message || "Internal error" }, env, 500);
+      return json({ error: error.message || "Internal error" }, env, 500, request);
     }
   }
 };
@@ -347,26 +347,37 @@ function mockImageSvg({ prompt, loraName, settings, index }) {
   </svg>`;
 }
 
-function json(payload, env, status = 200) {
+function json(payload, env, status = 200, request) {
   return new Response(JSON.stringify(payload), {
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
-      ...corsHeaders(env)
+      ...corsHeaders(env, request)
     }
   });
 }
 
-function corsResponse(env) {
-  return new Response(null, { status: 204, headers: corsHeaders(env) });
+function corsResponse(env, request) {
+  return new Response(null, { status: 204, headers: corsHeaders(env, request) });
 }
 
-function corsHeaders(env) {
+function corsHeaders(env, request) {
+  const origin = request?.headers.get("Origin") || "";
+  const allowedOrigin = pickAllowedOrigin(origin, env);
   return {
-    "Access-Control-Allow-Origin": env.APP_ORIGIN || "*",
+    "Access-Control-Allow-Origin": allowedOrigin,
     "Access-Control-Allow-Methods": "GET,POST,PATCH,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type,Authorization"
+    "Access-Control-Allow-Headers": "Content-Type,Authorization",
+    "Vary": "Origin"
   };
+}
+
+function pickAllowedOrigin(origin, env) {
+  if (!origin) return env.APP_ORIGIN || "*";
+  if (origin === env.APP_ORIGIN) return origin;
+  if (origin === "https://face-lora-studio.pages.dev") return origin;
+  if (/^https:\/\/[a-z0-9-]+\.face-lora-studio\.pages\.dev$/.test(origin)) return origin;
+  return env.APP_ORIGIN || "null";
 }
 
 function id(prefix) {
