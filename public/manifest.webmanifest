@@ -1,0 +1,15 @@
+{
+  "name": "Face LoRA Studio",
+  "short_name": "LoRA Studio",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#101318",
+  "theme_color": "#101318",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}

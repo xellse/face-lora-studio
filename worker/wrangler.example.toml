@@ -1,0 +1,17 @@
+name = "face-lora-api"
+main = "src/index.js"
+compatibility_date = "2026-06-01"
+
+[vars]
+APP_ORIGIN = "https://app.xellsun.com"
+PUBLIC_STORAGE_BASE_URL = "https://img.xellsun.com"
+RUNPOD_WORKSPACE = "/workspace"
+
+[[r2_buckets]]
+binding = "ASSETS"
+bucket_name = "face-lora-assets"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "face-lora-db"
+database_id = "replace-with-your-d1-database-id"
