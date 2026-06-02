@@ -204,9 +204,37 @@ function trainView(data) {
     steps: state.trainingDraft.steps ?? "3000",
     learningRate: state.trainingDraft.learningRate ?? "1e-4",
     rank: state.trainingDraft.rank ?? "32",
+    alpha: state.trainingDraft.alpha ?? "32",
+    convRank: state.trainingDraft.convRank ?? "0",
+    convAlpha: state.trainingDraft.convAlpha ?? "0",
     repeats: state.trainingDraft.repeats ?? "10",
     resolution: state.trainingDraft.resolution ?? "1024",
-    saveEvery: state.trainingDraft.saveEvery ?? "250"
+    saveEvery: state.trainingDraft.saveEvery ?? "250",
+    captionDropoutRate: state.trainingDraft.captionDropoutRate ?? "0.05",
+    batchSize: state.trainingDraft.batchSize ?? "1",
+    gradientAccumulation: state.trainingDraft.gradientAccumulation ?? "1",
+    optimizer: state.trainingDraft.optimizer ?? "adamw8bit",
+    timestepType: state.trainingDraft.timestepType ?? "weighted",
+    contentOrStyle: state.trainingDraft.contentOrStyle ?? "balanced",
+    weightDecay: state.trainingDraft.weightDecay ?? "0.0001",
+    dtype: state.trainingDraft.dtype ?? "bf16",
+    saveDtype: state.trainingDraft.saveDtype ?? "float16",
+    qtype: state.trainingDraft.qtype ?? "qfloat8",
+    qtypeTe: state.trainingDraft.qtypeTe ?? "qfloat8",
+    sampleSteps: state.trainingDraft.sampleSteps ?? "40",
+    guidanceScale: state.trainingDraft.guidanceScale ?? "5",
+    cacheLatentsToDisk: state.trainingDraft.cacheLatentsToDisk ?? "true",
+    cacheTextEmbeddings: state.trainingDraft.cacheTextEmbeddings ?? "true",
+    gradientCheckpointing: state.trainingDraft.gradientCheckpointing ?? "true",
+    trainTextEncoder: state.trainingDraft.trainTextEncoder ?? "false",
+    quantize: state.trainingDraft.quantize ?? "true",
+    quantizeTe: state.trainingDraft.quantizeTe ?? "true",
+    lowVram: state.trainingDraft.lowVram ?? "false",
+    layerOffloading: state.trainingDraft.layerOffloading ?? "false",
+    disableSampling: state.trainingDraft.disableSampling ?? "false",
+    bypassGuidanceEmbedding: state.trainingDraft.bypassGuidanceEmbedding ?? "false",
+    useEma: state.trainingDraft.useEma ?? "false",
+    emaDecay: state.trainingDraft.emaDecay ?? "0.99"
   };
   return `
     <section class="two-col">
@@ -230,9 +258,57 @@ function trainView(data) {
             <label>训练步数<input name="steps" type="number" value="${escapeHtml(draft.steps)}" min="1000" step="100" /></label>
             <label>学习率<input name="learningRate" value="${escapeHtml(draft.learningRate)}" /></label>
             <label>Rank<input name="rank" type="number" value="${escapeHtml(draft.rank)}" min="16" max="128" /></label>
+            <label>Alpha<input name="alpha" type="number" value="${escapeHtml(draft.alpha)}" min="1" max="128" /></label>
+            <label>Conv Rank<input name="convRank" type="number" value="${escapeHtml(draft.convRank)}" min="0" max="128" /></label>
+            <label>Conv Alpha<input name="convAlpha" type="number" value="${escapeHtml(draft.convAlpha)}" min="0" max="128" /></label>
             <label>图片重复<input name="repeats" type="number" value="${escapeHtml(draft.repeats)}" min="1" max="50" /></label>
             <label>训练分辨率<input name="resolution" type="number" value="${escapeHtml(draft.resolution)}" min="512" max="1536" step="128" /></label>
             <label>保存间隔<input name="saveEvery" type="number" value="${escapeHtml(draft.saveEvery)}" min="50" step="50" /></label>
+            <label>Caption Dropout<input name="captionDropoutRate" type="number" value="${escapeHtml(draft.captionDropoutRate)}" min="0" max="0.3" step="0.01" /></label>
+            <label>Batch Size<input name="batchSize" type="number" value="${escapeHtml(draft.batchSize)}" min="1" max="4" /></label>
+            <label>梯度累积<input name="gradientAccumulation" type="number" value="${escapeHtml(draft.gradientAccumulation)}" min="1" max="8" /></label>
+            <label>Optimizer
+              <select name="optimizer">
+                ${["adamw8bit", "adamw", "adamwfp8", "adafactor", "Prodigy"].map((option) => `<option value="${option}" ${draft.optimizer === option ? "selected" : ""}>${option}</option>`).join("")}
+              </select>
+            </label>
+            <label>Timestep
+              <select name="timestepType">
+                ${["weighted", "sigmoid", "linear", "uniform"].map((option) => `<option value="${option}" ${draft.timestepType === option ? "selected" : ""}>${option}</option>`).join("")}
+              </select>
+            </label>
+            <label>Content/Style
+              <select name="contentOrStyle">
+                ${["balanced", "content", "style"].map((option) => `<option value="${option}" ${draft.contentOrStyle === option ? "selected" : ""}>${option}</option>`).join("")}
+              </select>
+            </label>
+            <label>Weight Decay<input name="weightDecay" type="number" value="${escapeHtml(draft.weightDecay)}" min="0" max="0.1" step="0.0001" /></label>
+            <label>训练精度
+              <select name="dtype">${["bf16", "fp16", "float32"].map((option) => `<option value="${option}" ${draft.dtype === option ? "selected" : ""}>${option}</option>`).join("")}</select>
+            </label>
+            <label>保存精度
+              <select name="saveDtype">${["float16", "bf16", "fp16", "float32"].map((option) => `<option value="${option}" ${draft.saveDtype === option ? "selected" : ""}>${option}</option>`).join("")}</select>
+            </label>
+            <label>Transformer 量化
+              <select name="qtype">${["qfloat8", "float8", "qint8", "none"].map((option) => `<option value="${option}" ${draft.qtype === option ? "selected" : ""}>${option}</option>`).join("")}</select>
+            </label>
+            <label>Text Encoder 量化
+              <select name="qtypeTe">${["qfloat8", "float8", "qint8", "none"].map((option) => `<option value="${option}" ${draft.qtypeTe === option ? "selected" : ""}>${option}</option>`).join("")}</select>
+            </label>
+            <label>预览步数<input name="sampleSteps" type="number" value="${escapeHtml(draft.sampleSteps)}" min="15" max="80" /></label>
+            <label>预览 CFG<input name="guidanceScale" type="number" value="${escapeHtml(draft.guidanceScale)}" min="1" max="12" step="0.1" /></label>
+            ${trainingCheckbox("cacheLatentsToDisk", "缓存 Latents", draft.cacheLatentsToDisk)}
+            ${trainingCheckbox("cacheTextEmbeddings", "缓存文本 Embeddings", draft.cacheTextEmbeddings)}
+            ${trainingCheckbox("gradientCheckpointing", "Gradient Checkpointing", draft.gradientCheckpointing)}
+            ${trainingCheckbox("trainTextEncoder", "训练 Text Encoder", draft.trainTextEncoder)}
+            ${trainingCheckbox("quantize", "量化 Transformer", draft.quantize)}
+            ${trainingCheckbox("quantizeTe", "量化 Text Encoder", draft.quantizeTe)}
+            ${trainingCheckbox("lowVram", "Low VRAM", draft.lowVram)}
+            ${trainingCheckbox("layerOffloading", "Layer Offloading", draft.layerOffloading)}
+            ${trainingCheckbox("disableSampling", "关闭训练预览", draft.disableSampling)}
+            ${trainingCheckbox("bypassGuidanceEmbedding", "Bypass Guidance Embedding", draft.bypassGuidanceEmbedding)}
+            ${trainingCheckbox("useEma", "启用 EMA", draft.useEma)}
+            <label>EMA Decay<input name="emaDecay" type="number" value="${escapeHtml(draft.emaDecay)}" min="0.9" max="0.9999" step="0.001" /></label>
           </div>
           <button type="submit" ${readyDatasets.length ? "" : "disabled"}>启动训练</button>
         </div>
@@ -245,6 +321,11 @@ function trainView(data) {
       </section>
     </section>
   `;
+}
+
+function trainingCheckbox(name, label, value) {
+  const checked = value === true || value === "true";
+  return `<label class="check-label"><input type="hidden" name="${name}" value="false" /><span><input name="${name}" type="checkbox" value="true" ${checked ? "checked" : ""} /> ${label}</span></label>`;
 }
 
 function generateView(data) {

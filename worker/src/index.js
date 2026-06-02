@@ -201,14 +201,41 @@ async function createTrainingJob(request, env) {
     steps: Number(body.steps || 3000),
     learningRate: body.learningRate || "1e-4",
     rank: Number(body.rank || 32),
+    alpha: Number(body.alpha || body.rank || 32),
+    convRank: Number(body.convRank || 0),
+    convAlpha: Number(body.convAlpha || body.convRank || 0),
     repeats: Number(body.repeats || 10),
     resolution: Number(body.resolution || 1024),
     saveEvery: Number(body.saveEvery || 250),
-    architecture: "z-image",
+    captionDropoutRate: Number(body.captionDropoutRate || 0.05),
+    batchSize: Number(body.batchSize || 1),
+    gradientAccumulation: Number(body.gradientAccumulation || 1),
+    optimizer: body.optimizer || "adamw8bit",
+    timestepType: body.timestepType || "weighted",
+    contentOrStyle: body.contentOrStyle || "balanced",
+    weightDecay: Number(body.weightDecay || 0.0001),
+    dtype: body.dtype || "bf16",
+    saveDtype: body.saveDtype || "float16",
+    qtype: body.qtype || "qfloat8",
+    qtypeTe: body.qtypeTe || "qfloat8",
+    sampleSteps: Number(body.sampleSteps || 40),
+    guidanceScale: Number(body.guidanceScale || 5),
+    cacheLatentsToDisk: boolParam(body.cacheLatentsToDisk, true),
+    cacheTextEmbeddings: boolParam(body.cacheTextEmbeddings, true),
+    gradientCheckpointing: boolParam(body.gradientCheckpointing, true),
+    trainTextEncoder: boolParam(body.trainTextEncoder, false),
+    quantize: boolParam(body.quantize, true),
+    quantizeTe: boolParam(body.quantizeTe, true),
+    lowVram: boolParam(body.lowVram, false),
+    layerOffloading: boolParam(body.layerOffloading, false),
+    disableSampling: boolParam(body.disableSampling, false),
+    bypassGuidanceEmbedding: boolParam(body.bypassGuidanceEmbedding, false),
+    useEma: boolParam(body.useEma, false),
+    emaDecay: Number(body.emaDecay || 0.99),
+    architecture: "zimage",
     modelRepo: Z_IMAGE_REPO,
-    quantization: "float8",
-    precision: "bf16",
-    optimizer: "AdamW8Bit"
+    quantization: body.qtype || "qfloat8",
+    precision: body.dtype || "bf16"
   };
 
   await env.DB.prepare(
@@ -468,6 +495,12 @@ function comfyLoraFile(lora) {
   if (modelPath.includes(marker)) return modelPath.split(marker, 2)[1];
   if (modelPath.endsWith(".safetensors")) return `${USER_ID}/${modelPath.split("/").pop()}`;
   return `${USER_ID}/${lora.id}.safetensors`;
+}
+
+function boolParam(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  return String(value).toLowerCase() === "true";
 }
 
 async function syncDatasetProcessingResult(env, localJob, runpodJob, status, progress) {

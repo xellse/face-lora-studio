@@ -17,6 +17,11 @@ from huggingface_hub import snapshot_download
 from PIL import Image, ImageDraw, ImageOps
 from pydantic import BaseModel, Field
 
+try:
+    import cv2
+except Exception:
+    cv2 = None
+
 
 WORKSPACE = Path(os.environ.get("RUNPOD_WORKSPACE", "/workspace"))
 JOBS_DIR = WORKSPACE / "jobs"
@@ -33,13 +38,14 @@ Z_IMAGE_MODEL_DIR = Path(os.environ.get("Z_IMAGE_MODEL_DIR", MODEL_CACHE_DIR / "
 HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-3-flash-preview")
+FACE_DETECTOR = os.environ.get("FACE_DETECTOR", "opencv").strip().lower()
 R2_ENDPOINT = os.environ.get("R2_ENDPOINT", "")
 R2_BUCKET = os.environ.get("R2_BUCKET", "face-lora-assets")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 PUBLIC_STORAGE_BASE_URL = os.environ.get("PUBLIC_STORAGE_BASE_URL", "https://img.xellsun.com").rstrip("/")
 
-APP_VERSION = "0.1.9"
+APP_VERSION = "0.2.0"
 
 app = FastAPI(title="Face LoRA RunPod Worker", version=APP_VERSION)
 
@@ -118,6 +124,8 @@ def health():
             "deployed": z_image_model_is_ready(),
         },
         "datasetProcessing": {
+            "faceDetector": FACE_DETECTOR,
+            "opencvConfigured": cv2 is not None,
             "visionProvider": "openrouter",
             "visionModel": OPENROUTER_MODEL,
             "cropPolicy": "face_center_square_crop_resize_only",
@@ -237,7 +245,7 @@ def process_dataset(job_id: str, payload: DatasetJobRequest):
         if not (R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY):
             raise RuntimeError("R2 upload environment variables are not configured")
 
-        update_job(job_id, 8, "running", "Preparing Gemini crop/caption pipeline")
+        update_job(job_id, 8, "running", "Preparing local face detection and Gemini caption pipeline")
         job_dir = JOBS_DIR / job_id
         raw_dir = job_dir / "raw"
         faces_dir = job_dir / "faces"
@@ -252,11 +260,20 @@ def process_dataset(job_id: str, payload: DatasetJobRequest):
             source_image = download_image(raw.url)
             source_image.save(raw_path, "JPEG", quality=95)
 
-            analysis = analyze_face_with_openrouter(raw.url, payload.trigger_word)
+            try:
+                analysis = detect_face_geometry(source_image)
+            except Exception as exc:
+                review_items.append({
+                    "id": raw.id,
+                    "reason": f"Face detection failed: {exc}",
+                    "sourceUrl": raw.url,
+                })
+                continue
+
             if not analysis.get("usable", True):
                 review_items.append({
                     "id": raw.id,
-                    "reason": analysis.get("reason", "Gemini marked this image unusable"),
+                    "reason": analysis.get("reason", "Face detector marked this image unusable"),
                     "sourceUrl": raw.url,
                 })
                 continue
@@ -275,10 +292,10 @@ def process_dataset(job_id: str, payload: DatasetJobRequest):
             face_path = faces_dir / f"{face_id}.jpg"
             crop.save(face_path, "JPEG", quality=95)
 
-            caption = ensure_trigger_word(analysis.get("caption", ""), payload.trigger_word)
-            (faces_dir / f"{face_id}.txt").write_text(caption)
             object_key = f"datasets/{payload.dataset_id}/faces/{face_id}.jpg"
             https_url = upload_file_to_r2(face_path, object_key, "image/jpeg")
+            caption = caption_face_with_openrouter(https_url, payload.trigger_word)
+            (faces_dir / f"{face_id}.txt").write_text(caption)
             faces.append({
                 "id": face_id,
                 "status": "approved",
@@ -287,6 +304,7 @@ def process_dataset(job_id: str, payload: DatasetJobRequest):
                 "httpsUrl": https_url,
                 "cropSize": payload.crop_size,
                 "sourceUrl": raw.url,
+                "faceDetector": analysis.get("detector", FACE_DETECTOR),
             })
 
         update_job(job_id, 100, "completed", "Dataset crop and caption completed", {
@@ -294,6 +312,7 @@ def process_dataset(job_id: str, payload: DatasetJobRequest):
             "reviewItems": review_items,
             "cropSize": payload.crop_size,
             "visionModel": OPENROUTER_MODEL,
+            "faceDetector": FACE_DETECTOR,
         })
     except Exception as exc:
         update_job(job_id, 100, "failed", f"Dataset processing failed: {exc}", {
@@ -309,27 +328,23 @@ def download_image(url: str) -> Image.Image:
     return ImageOps.exif_transpose(image).convert("RGB")
 
 
-def analyze_face_with_openrouter(image_url: str, trigger_word: str) -> dict[str, Any]:
-    prompt = f"""Analyze this image for FACE LoRA training preparation.
+def caption_face_with_openrouter(image_url: str, trigger_word: str) -> str:
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is not configured")
+    prompt = f"""Caption this cropped face training image for a Z-Image face LoRA dataset.
 Return JSON only with this shape:
 {{
   "usable": true,
   "reason": "",
-  "faceTarget": "face_head_only",
-  "containsBodyInFaceBox": false,
-  "face": {{"centerX": 0.50, "centerY": 0.34, "width": 0.34, "height": 0.42}},
-  "bbox": {{"x": 0.33, "y": 0.13, "width": 0.34, "height": 0.42}},
-  "caption": "{trigger_word}, close-up portrait, ..."
+  "caption": "{trigger_word}, close-up face portrait, ..."
 }}
 Rules:
-- The goal is a face LoRA dataset, not a full-body or half-body dataset.
-- face is the tight normalized geometry of the main person's visible face/head only.
-- face must cover the face oval, chin, forehead, ears, and hair mass only.
-- face and bbox must exclude shoulders, torso, arms, hands, clothing below the neck, watermarks, captions, and background text.
-- If the original photo is full-body or half-body, still return face geometry around the face/head only.
-- Set containsBodyInFaceBox=true if face/bbox includes shoulders, torso, hands, or significant clothing below the neck.
-- If the face is too small, too blurry, occluded, or there is no clear single main face, set usable=false and explain reason.
-- Caption should be concise visual training text and must not include names or identity claims.
+- Describe only visible face and head traits useful for reproducing the same face.
+- Include face shape, eye shape, gaze direction, eyebrow shape, nose, lips, cheeks, jaw/chin, hairstyle/bangs, hair color, expression, head angle, camera angle, lighting on the face, and visible face accessories.
+- Mention upper clothing only if it is visible near the neck and useful context; keep it brief.
+- Do not describe background, pose, body, hands, camera props, scene location, watermarks, or text.
+- Do not include real names, celebrity names, identity claims, or unsupported personality claims.
+- Keep the caption one concise comma-separated sentence, 35 to 80 words.
 - Include the trigger word exactly once in the caption: {trigger_word}
 """
     response = requests.post(
@@ -359,7 +374,63 @@ Rules:
     response.raise_for_status()
     payload = response.json()
     content = payload["choices"][0]["message"]["content"]
-    return parse_json_object(content)
+    result = parse_json_object(content)
+    if not result.get("usable", True):
+        raise RuntimeError(result.get("reason", "Gemini marked this cropped face unusable"))
+    return ensure_trigger_word(result.get("caption", ""), trigger_word)
+
+
+def detect_face_geometry(image: Image.Image) -> dict[str, Any]:
+    if FACE_DETECTOR == "opencv":
+        return detect_face_with_opencv(image)
+    raise RuntimeError(f"Unsupported FACE_DETECTOR={FACE_DETECTOR}")
+
+
+def detect_face_with_opencv(image: Image.Image) -> dict[str, Any]:
+    if cv2 is None:
+        raise RuntimeError("opencv-python-headless is not installed")
+    rgb = np_image_rgb(image)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    gray = cv2.equalizeHist(gray)
+    cascades = [
+        ("frontal", "haarcascade_frontalface_default.xml"),
+        ("frontal_alt2", "haarcascade_frontalface_alt2.xml"),
+    ]
+    faces = []
+    for label, filename in cascades:
+        cascade = cv2.CascadeClassifier(str(Path(cv2.data.haarcascades) / filename))
+        detections = cascade.detectMultiScale(gray, scaleFactor=1.08, minNeighbors=4, minSize=(64, 64))
+        for (x, y, w, h) in detections:
+            faces.append((label, int(x), int(y), int(w), int(h)))
+    if not faces:
+        raise RuntimeError("No clear frontal face detected")
+    height, width = gray.shape[:2]
+    faces.sort(key=lambda face: face[3] * face[4], reverse=True)
+    label, x, y, w, h = faces[0]
+    face = {
+        "centerX": clamp((x + w / 2) / width, 0, 1),
+        "centerY": clamp((y + h / 2) / height, 0, 1),
+        "width": clamp(w / width, 0.03, 1),
+        "height": clamp(h / height, 0.03, 1),
+    }
+    return {
+        "usable": True,
+        "reason": "",
+        "detector": f"opencv:{label}",
+        "containsBodyInFaceBox": False,
+        "face": face,
+        "bbox": {
+            "x": clamp(x / width, 0, 1),
+            "y": clamp(y / height, 0, 1),
+            "width": face["width"],
+            "height": face["height"],
+        },
+    }
+
+
+def np_image_rgb(image: Image.Image):
+    import numpy as np
+    return np.array(image.convert("RGB"))
 
 
 def parse_json_object(content: Any) -> dict[str, Any]:
@@ -429,9 +500,9 @@ def validate_face_geometry(face: dict[str, float]):
     width = face["width"]
     height = face["height"]
     area = width * height
-    if width > 0.68 or height > 0.68:
-        raise RuntimeError("face geometry is too large and likely includes body framing")
-    if area > 0.34:
+    if width > 0.95 or height > 0.95:
+        raise RuntimeError("face geometry covers almost the entire image")
+    if area > 0.72:
         raise RuntimeError("face geometry area is too large for face-only training")
     if width < 0.04 or height < 0.04:
         raise RuntimeError("face geometry is too small for reliable training crop")
@@ -653,6 +724,11 @@ def write_z_image_training_config(job_id: str, payload: TrainingJobRequest, imag
     config_path = job_dir / "z_image_base_ai_toolkit_config.yaml"
     output_dir = job_dir / "ai_toolkit_output"
     safe_name = safe_job_name(payload.lora_id)
+    network_extra = ""
+    if parameters["convRank"] > 0:
+        network_extra = f"""
+        conv: {parameters["convRank"]}
+        conv_alpha: {parameters["convAlpha"]}"""
     config_path.write_text(f"""---
 job: extension
 config:
@@ -665,39 +741,62 @@ config:
       network:
         type: "lora"
         linear: {parameters["rank"]}
-        linear_alpha: {parameters["rank"]}
+        linear_alpha: {parameters["alpha"]}{network_extra}
       save:
-        dtype: float16
+        dtype: {parameters["saveDtype"]}
         save_every: {parameters["saveEvery"]}
         max_step_saves_to_keep: 4
+        save_format: "diffusers"
         push_to_hub: false
       datasets:
         - folder_path: "{images_dir}"
           caption_ext: "txt"
-          caption_dropout_rate: 0.05
+          caption_dropout_rate: {parameters["captionDropoutRate"]}
           shuffle_tokens: false
-          cache_latents_to_disk: true
+          cache_latents_to_disk: {yaml_bool(parameters["cacheLatentsToDisk"])}
+          num_repeats: {parameters["repeats"]}
+          network_weight: 1
           resolution: [ {parameters["resolution"]} ]
       train:
-        batch_size: 1
-        cache_text_embeddings: true
+        batch_size: {parameters["batchSize"]}
+        bypass_guidance_embedding: {yaml_bool(parameters["bypassGuidanceEmbedding"])}
+        cache_text_embeddings: {yaml_bool(parameters["cacheTextEmbeddings"])}
         steps: {parameters["steps"]}
-        gradient_accumulation: 1
+        gradient_accumulation: {parameters["gradientAccumulation"]}
         train_unet: true
-        train_text_encoder: false
-        gradient_checkpointing: true
+        train_text_encoder: {yaml_bool(parameters["trainTextEncoder"])}
+        gradient_checkpointing: {yaml_bool(parameters["gradientCheckpointing"])}
         noise_scheduler: "flowmatch"
-        optimizer: "adamw8bit"
+        optimizer: "{yaml_escape(parameters["optimizer"])}"
+        timestep_type: "{yaml_escape(parameters["timestepType"])}"
+        content_or_style: "{yaml_escape(parameters["contentOrStyle"])}"
+        optimizer_params:
+          weight_decay: {parameters["weightDecay"]}
+        unload_text_encoder: false
         lr: {parameters["learningRate"]}
-        dtype: bf16
+        ema_config:
+          use_ema: {yaml_bool(parameters["useEma"])}
+          ema_decay: {parameters["emaDecay"]}
+        skip_first_sample: false
+        force_first_sample: false
+        disable_sampling: {yaml_bool(parameters["disableSampling"])}
+        dtype: {parameters["dtype"]}
+        diff_output_preservation: false
+        diff_output_preservation_multiplier: 1
+        diff_output_preservation_class: "person"
+        switch_boundary_every: 1
+        loss_type: "mse"
       model:
         name_or_path: "{yaml_escape(str(model_path))}"
         arch: "{yaml_escape(Z_IMAGE_ARCH)}"
-        quantize: true
-        qtype: "qfloat8"
-        quantize_te: true
-        qtype_te: "qfloat8"
-        low_vram: false
+        quantize: {yaml_bool(parameters["quantize"])}
+        qtype: "{yaml_escape(parameters["qtype"])}"
+        quantize_te: {yaml_bool(parameters["quantizeTe"])}
+        qtype_te: "{yaml_escape(parameters["qtypeTe"])}"
+        low_vram: {yaml_bool(parameters["lowVram"])}
+        layer_offloading: {yaml_bool(parameters["layerOffloading"])}
+        layer_offloading_text_encoder_percent: 1
+        layer_offloading_transformer_percent: 1
       sample:
         sampler: "flowmatch"
         sample_every: {parameters["saveEvery"]}
@@ -708,8 +807,8 @@ config:
         neg: ""
         seed: 42
         walk_seed: true
-        guidance_scale: 5
-        sample_steps: 40
+        guidance_scale: {parameters["guidanceScale"]}
+        sample_steps: {parameters["sampleSteps"]}
 meta:
   name: "[name]"
   version: "1.0"
@@ -793,9 +892,37 @@ def z_image_training_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
         "steps": int(parameters.get("steps", 3000)),
         "learningRate": parameters.get("learningRate", "1e-4"),
         "rank": int(parameters.get("rank", 32)),
+        "alpha": int(parameters.get("alpha", parameters.get("rank", 32))),
+        "convRank": int(parameters.get("convRank", 0)),
+        "convAlpha": int(parameters.get("convAlpha", parameters.get("convRank", 0))),
         "repeats": int(parameters.get("repeats", 10)),
         "resolution": int(parameters.get("resolution", 1024)),
         "saveEvery": int(parameters.get("saveEvery", 250)),
+        "captionDropoutRate": float(parameters.get("captionDropoutRate", 0.05)),
+        "batchSize": int(parameters.get("batchSize", 1)),
+        "gradientAccumulation": int(parameters.get("gradientAccumulation", 1)),
+        "optimizer": str(parameters.get("optimizer", "adamw8bit")),
+        "timestepType": str(parameters.get("timestepType", "weighted")),
+        "contentOrStyle": str(parameters.get("contentOrStyle", "balanced")),
+        "weightDecay": float(parameters.get("weightDecay", 0.0001)),
+        "dtype": str(parameters.get("dtype", "bf16")),
+        "saveDtype": str(parameters.get("saveDtype", "float16")),
+        "qtype": str(parameters.get("qtype", "qfloat8")),
+        "qtypeTe": str(parameters.get("qtypeTe", "qfloat8")),
+        "sampleSteps": int(parameters.get("sampleSteps", 40)),
+        "guidanceScale": float(parameters.get("guidanceScale", 5)),
+        "cacheLatentsToDisk": bool_param(parameters.get("cacheLatentsToDisk", True)),
+        "cacheTextEmbeddings": bool_param(parameters.get("cacheTextEmbeddings", True)),
+        "gradientCheckpointing": bool_param(parameters.get("gradientCheckpointing", True)),
+        "trainTextEncoder": bool_param(parameters.get("trainTextEncoder", False)),
+        "quantize": bool_param(parameters.get("quantize", True)),
+        "quantizeTe": bool_param(parameters.get("quantizeTe", True)),
+        "lowVram": bool_param(parameters.get("lowVram", False)),
+        "layerOffloading": bool_param(parameters.get("layerOffloading", False)),
+        "disableSampling": bool_param(parameters.get("disableSampling", False)),
+        "bypassGuidanceEmbedding": bool_param(parameters.get("bypassGuidanceEmbedding", False)),
+        "useEma": bool_param(parameters.get("useEma", False)),
+        "emaDecay": float(parameters.get("emaDecay", 0.99)),
     }
 
 
@@ -805,6 +932,18 @@ def safe_job_name(value: str) -> str:
 
 def yaml_escape(value: str) -> str:
     return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def yaml_bool(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def bool_param(value: Any, fallback: bool = False) -> bool:
+    if value is None:
+        return fallback
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() == "true"
 
 
 def process_generation(job_id: str, payload: GenerationJobRequest):

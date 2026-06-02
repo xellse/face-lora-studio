@@ -71,6 +71,19 @@ textarea {
   padding: 11px 12px;
 }
 
+input[type="checkbox"] {
+  width: auto;
+  padding: 0;
+}
+
+.check-label span {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 44px;
+  color: var(--ink);
+}
+
 textarea {
   min-height: 88px;
   resize: vertical;
