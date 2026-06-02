@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 WORKSPACE = Path(os.environ.get("RUNPOD_WORKSPACE", "/workspace"))
 JOBS_DIR = WORKSPACE / "jobs"
 COMFY_BASE_URL = os.environ.get("COMFY_BASE_URL", "http://127.0.0.1:8188").rstrip("/")
+COMFY_WORKFLOW_PATH = Path(os.environ.get("COMFY_WORKFLOW_PATH", WORKSPACE / "ComfyUI/workflows/zimage_lora_api.json"))
 WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
 Z_IMAGE_BASE_MODEL = "z-image-base"
 Z_IMAGE_REPO = "Tongyi-MAI/Z-Image"
@@ -38,7 +39,7 @@ R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 PUBLIC_STORAGE_BASE_URL = os.environ.get("PUBLIC_STORAGE_BASE_URL", "https://img.xellsun.com").rstrip("/")
 
-APP_VERSION = "0.1.6"
+APP_VERSION = "0.1.7"
 
 app = FastAPI(title="Face LoRA RunPod Worker", version=APP_VERSION)
 
@@ -85,6 +86,9 @@ class GenerationJobRequest(BaseModel):
     task_id: str = Field(alias="taskId")
     user_id: str = Field(default="local-user", alias="userId")
     lora_id: str = Field(alias="loraId")
+    lora_name: str | None = Field(default=None, alias="loraName")
+    lora_file: str | None = Field(default=None, alias="loraFile")
+    model_path: str | None = Field(default=None, alias="modelPath")
     prompt: str
     negative_prompt: str = Field(default="", alias="negativePrompt")
     settings: dict[str, Any] = Field(default_factory=dict)
@@ -128,6 +132,7 @@ def health():
             "models": str(MODEL_CACHE_DIR),
             "zImageBase": str(Z_IMAGE_MODEL_DIR),
             "loras": str(WORKSPACE / "ComfyUI/models/loras/local-user"),
+            "comfyWorkflow": str(COMFY_WORKFLOW_PATH),
         },
         "comfy": comfy,
     }
@@ -150,7 +155,7 @@ def create_training_job(payload: TrainingJobRequest, background_tasks: Backgroun
 @app.post("/jobs/generate", dependencies=[Depends(require_token)])
 def create_generation_job(payload: GenerationJobRequest, background_tasks: BackgroundTasks):
     job = create_job("generation", payload.model_dump(by_alias=True))
-    background_tasks.add_task(simulate_generation, job["id"])
+    background_tasks.add_task(process_generation, job["id"], payload)
     return job
 
 
@@ -476,6 +481,23 @@ def upload_file_to_r2(path: Path, key: str, content_type: str) -> str:
     return f"{PUBLIC_STORAGE_BASE_URL}/{key}"
 
 
+def upload_bytes_to_r2(content: bytes, key: str, content_type: str) -> str:
+    client = boto3.client(
+        "s3",
+        endpoint_url=R2_ENDPOINT,
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        region_name="auto",
+    )
+    client.put_object(
+        Bucket=R2_BUCKET,
+        Key=key,
+        Body=content,
+        ContentType=content_type,
+    )
+    return f"{PUBLIC_STORAGE_BASE_URL}/{key}"
+
+
 def prepare_z_image_model_job(job_id: str):
     try:
         update_job(job_id, 5, "running", "Preparing local Z-Image Base model directory")
@@ -785,14 +807,219 @@ def yaml_escape(value: str) -> str:
     return str(value).replace("\\", "\\\\").replace('"', '\\"')
 
 
-def simulate_generation(job_id: str):
-    update_job(job_id, 25, "running", "Preparing ComfyUI workflow")
-    time.sleep(1)
-    update_job(job_id, 65, "running", "ComfyUI generation placeholder")
-    time.sleep(1)
-    update_job(job_id, 100, "completed", "Generation placeholder completed", {
-        "note": "Replace this step with ComfyUI /prompt and output upload.",
-    })
+def process_generation(job_id: str, payload: GenerationJobRequest):
+    try:
+        if not COMFY_WORKFLOW_PATH.exists():
+            raise RuntimeError(f"ComfyUI workflow not found at {COMFY_WORKFLOW_PATH}")
+        if not (R2_ENDPOINT and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY):
+            raise RuntimeError("R2 upload environment variables are not configured")
+
+        settings = generation_settings(payload.settings)
+        images: list[dict[str, Any]] = []
+        update_job(job_id, 8, "running", "Loading ComfyUI workflow")
+
+        for index in range(settings["count"]):
+            seed = settings["seed"] + index
+            update_job(job_id, min(92, 10 + int(index / max(1, settings["count"]) * 80)), "running", f"Generating image {index + 1} of {settings['count']}")
+            workflow = load_generation_workflow()
+            patch_generation_workflow(workflow, payload, settings, seed, index)
+            comfy_prompt_id = queue_comfy_prompt(workflow, job_id)
+            history = wait_for_comfy_history(comfy_prompt_id, job_id)
+            output_images = download_comfy_history_images(history)
+            if not output_images:
+                raise RuntimeError(f"ComfyUI returned no images for prompt {comfy_prompt_id}")
+            for image_bytes, content_type in output_images:
+                if len(images) >= settings["count"]:
+                    break
+                image_index = len(images)
+                extension = "png" if content_type == "image/png" else "jpg"
+                object_key = f"generated/{payload.user_id}/{payload.task_id}/image_{image_index + 1}.{extension}"
+                https_url = upload_bytes_to_r2(image_bytes, object_key, content_type)
+                images.append({
+                    "id": f"image_{uuid.uuid4().hex[:8]}",
+                    "index": image_index,
+                    "localUrl": https_url,
+                    "httpsUrl": https_url,
+                    "width": settings["width"],
+                    "height": settings["height"],
+                    "seed": seed,
+                    "comfyPromptId": comfy_prompt_id,
+                })
+
+        update_job(job_id, 100, "completed", "ComfyUI generation completed", {
+            "taskId": payload.task_id,
+            "images": images,
+            "settings": settings,
+            "workflowPath": str(COMFY_WORKFLOW_PATH),
+        })
+    except Exception as exc:
+        update_job(job_id, 100, "failed", f"Generation failed: {exc}", {
+            "error": str(exc),
+            "taskId": payload.task_id,
+            "workflowPath": str(COMFY_WORKFLOW_PATH),
+        })
+
+
+def generation_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "count": max(1, min(12, int(settings.get("count", 1)))),
+        "width": int(settings.get("width", 1024)),
+        "height": int(settings.get("height", 1024)),
+        "seed": int(settings.get("seed", random_seed())),
+        "steps": int(settings.get("steps", 40)),
+        "cfg": float(settings.get("cfg", 5)),
+        "sampler": str(settings.get("sampler", "euler")),
+        "loraWeight": float(settings.get("loraWeight", 0.85)),
+    }
+
+
+def random_seed() -> int:
+    return int(time.time() * 1000) % 2_000_000_000
+
+
+def load_generation_workflow() -> dict[str, Any]:
+    workflow = json.loads(COMFY_WORKFLOW_PATH.read_text())
+    if not isinstance(workflow, dict):
+        raise RuntimeError("ComfyUI workflow JSON must be an API workflow object")
+    return workflow
+
+
+def patch_generation_workflow(workflow: dict[str, Any], payload: GenerationJobRequest, settings: dict[str, Any], seed: int, index: int):
+    lora_name = payload.lora_file or comfy_lora_name(payload)
+    replacements = {
+        "__PROMPT__": payload.prompt,
+        "__NEGATIVE_PROMPT__": payload.negative_prompt,
+        "__LORA_NAME__": lora_name,
+        "__LORA_FILE__": lora_name,
+        "__LORA_WEIGHT__": settings["loraWeight"],
+        "__WIDTH__": settings["width"],
+        "__HEIGHT__": settings["height"],
+        "__SEED__": seed,
+        "__STEPS__": settings["steps"],
+        "__CFG__": settings["cfg"],
+        "__SAMPLER__": settings["sampler"],
+        "__TASK_ID__": payload.task_id,
+        "__INDEX__": index + 1,
+    }
+    replace_placeholders(workflow, replacements)
+
+    clip_nodes = []
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
+        inputs = node.get("inputs")
+        if not isinstance(inputs, dict):
+            continue
+        class_type = str(node.get("class_type", ""))
+        lower_class = class_type.lower()
+
+        if "lora" in lower_class:
+            set_existing(inputs, ["lora_name", "lora", "name"], lora_name)
+            set_existing(inputs, ["strength_model", "strength_clip", "strength"], settings["loraWeight"])
+
+        if "ksampler" in lower_class or "sampler" in lower_class:
+            set_existing(inputs, ["seed"], seed)
+            set_existing(inputs, ["steps"], settings["steps"])
+            set_existing(inputs, ["cfg"], settings["cfg"])
+            set_existing(inputs, ["sampler_name", "sampler"], settings["sampler"])
+
+        if "emptylatentimage" in lower_class or "latent" in lower_class:
+            set_existing(inputs, ["width"], settings["width"])
+            set_existing(inputs, ["height"], settings["height"])
+            set_existing(inputs, ["batch_size"], 1)
+
+        if "saveimage" in lower_class:
+            set_existing(inputs, ["filename_prefix"], f"face-lora/{payload.task_id}/{index + 1:03d}")
+
+        if "cliptextencode" in lower_class and "text" in inputs:
+            clip_nodes.append((str(node_id), inputs))
+
+    clip_nodes.sort(key=lambda item: item[0])
+    if clip_nodes:
+        clip_nodes[0][1]["text"] = payload.prompt
+    if len(clip_nodes) > 1:
+        clip_nodes[1][1]["text"] = payload.negative_prompt
+
+
+def replace_placeholders(value: Any, replacements: dict[str, Any]) -> Any:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            value[key] = replace_placeholders(item, replacements)
+        return value
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            value[index] = replace_placeholders(item, replacements)
+        return value
+    if isinstance(value, str):
+        for token, replacement in replacements.items():
+            if value == token:
+                return replacement
+            value = value.replace(token, str(replacement))
+    return value
+
+
+def set_existing(inputs: dict[str, Any], keys: list[str], value: Any):
+    for key in keys:
+        if key in inputs:
+            inputs[key] = value
+
+
+def comfy_lora_name(payload: GenerationJobRequest) -> str:
+    if payload.model_path:
+        marker = "/models/loras/"
+        if marker in payload.model_path:
+            return payload.model_path.split(marker, 1)[1]
+        path = Path(payload.model_path)
+        if path.name:
+            return f"{payload.user_id}/{path.name}"
+    return f"{payload.user_id}/{payload.lora_id}.safetensors"
+
+
+def queue_comfy_prompt(workflow: dict[str, Any], job_id: str) -> str:
+    response = requests.post(f"{COMFY_BASE_URL}/prompt", json={
+        "prompt": workflow,
+        "client_id": job_id,
+    }, timeout=30)
+    response.raise_for_status()
+    payload = response.json()
+    prompt_id = payload.get("prompt_id")
+    if not prompt_id:
+        raise RuntimeError(f"ComfyUI /prompt did not return prompt_id: {payload}")
+    return prompt_id
+
+
+def wait_for_comfy_history(prompt_id: str, job_id: str) -> dict[str, Any]:
+    deadline = time.time() + 1800
+    while time.time() < deadline:
+        response = requests.get(f"{COMFY_BASE_URL}/history/{prompt_id}", timeout=30)
+        response.raise_for_status()
+        history = response.json()
+        if prompt_id in history:
+            return history[prompt_id]
+        append_job_log(job_id, f"Waiting for ComfyUI prompt {prompt_id}", status="running")
+        time.sleep(2)
+    raise RuntimeError(f"Timed out waiting for ComfyUI prompt {prompt_id}")
+
+
+def download_comfy_history_images(history: dict[str, Any]) -> list[tuple[bytes, str]]:
+    images: list[tuple[bytes, str]] = []
+    outputs = history.get("outputs", {})
+    if not isinstance(outputs, dict):
+        return images
+    for output in outputs.values():
+        for image in output.get("images", []) if isinstance(output, dict) else []:
+            filename = image.get("filename")
+            if not filename:
+                continue
+            response = requests.get(f"{COMFY_BASE_URL}/view", params={
+                "filename": filename,
+                "subfolder": image.get("subfolder", ""),
+                "type": image.get("type", "output"),
+            }, timeout=120)
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "image/png").split(";")[0]
+            images.append((response.content, content_type if content_type.startswith("image/") else "image/png"))
+    return images
 
 
 def update_job(job_id: str, progress: int, status: str, message: str, result: dict[str, Any] | None = None):

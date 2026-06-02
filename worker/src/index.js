@@ -270,6 +270,7 @@ async function createGenerationTask(request, env) {
   const body = await request.json();
   const lora = await env.DB.prepare("SELECT * FROM loras WHERE id = ?").bind(body.loraId).first();
   if (!lora) throw new Error("Selected LoRA not found");
+  if (lora.status !== "ready") throw new Error("Selected LoRA is not ready");
 
   const now = nowIso();
   const taskId = id("gen");
@@ -284,22 +285,17 @@ async function createGenerationTask(request, env) {
     sampler: body.sampler || "euler",
     loraWeight: Number(body.loraWeight || 0.85)
   };
-  const images = [];
-
-  for (let index = 0; index < count; index += 1) {
-    const key = `generated/${USER_ID}/${taskId}/image_${index + 1}.svg`;
-    const svg = mockImageSvg({ prompt: body.prompt, loraName: lora.name, settings, index });
-    await env.ASSETS.put(key, svg, { httpMetadata: { contentType: "image/svg+xml" } });
-    images.push({
-      id: id("image"),
-      index,
-      localUrl: `${env.PUBLIC_STORAGE_BASE_URL}/${key}`,
-      httpsUrl: `${env.PUBLIC_STORAGE_BASE_URL}/${key}`,
-      width: settings.width,
-      height: settings.height,
-      seed: settings.seed + index
-    });
-  }
+  const runpodJob = await callRunPod(env, "/jobs/generate", {
+    taskId,
+    userId: USER_ID,
+    loraId: body.loraId,
+    loraName: lora.name,
+    loraFile: comfyLoraFile(lora),
+    modelPath: lora.model_path,
+    prompt: body.prompt,
+    negativePrompt: body.negativePrompt || "",
+    settings
+  });
 
   await env.DB.prepare(
     "INSERT INTO generation_tasks (id, user_id, lora_id, lora_name, status, progress, folder_name, prompt, negative_prompt, settings, images, message, comfy_prompt_id, created_at, updated_at, completed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -309,22 +305,35 @@ async function createGenerationTask(request, env) {
       USER_ID,
       body.loraId,
       lora.name,
-      "completed",
-      100,
+      runpodJob.status || "queued",
+      Number(runpodJob.progress || 0),
       `${new Date().toISOString().slice(0, 10)} ${lora.name}`,
       body.prompt,
       body.negativePrompt || "",
       JSON.stringify(settings),
-      JSON.stringify(images),
-      "Images created in R2. Replace this mock step with RunPod ComfyUI call.",
-      id("prompt"),
+      JSON.stringify([]),
+      runpodJob.message || "ComfyUI generation queued on RunPod",
+      runpodJob.id || null,
       now,
       now,
-      now
+      null
     )
     .run();
 
-  return { taskId };
+  const job = await insertJob(env, {
+    type: "generation",
+    status: runpodJob.status || "queued",
+    progress: Number(runpodJob.progress || 0),
+    loraId: body.loraId,
+    generationTaskId: taskId,
+    message: runpodJob.message || "ComfyUI generation queued on RunPod",
+    payload: {
+      runpodJobId: runpodJob.id,
+      runpodType: runpodJob.type
+    }
+  });
+
+  return { taskId, job };
 }
 
 async function insertJob(env, input) {
@@ -407,6 +416,11 @@ async function syncRunPodJob(env, localJob, runpodJob) {
     return;
   }
 
+  if (localJob.type === "generation" && localJob.generation_task_id) {
+    await syncGenerationResult(env, localJob, runpodJob, status, progress, message);
+    return;
+  }
+
   if (localJob.type !== "lora_training" || !localJob.lora_id) return;
 
   if (status === "completed") {
@@ -423,6 +437,34 @@ async function syncRunPodJob(env, localJob, runpodJob) {
       .bind("training", progress, nowIso(), localJob.lora_id)
       .run();
   }
+}
+
+async function syncGenerationResult(env, localJob, runpodJob, status, progress, message) {
+  const localPayload = parseJson(localJob.payload, {});
+  if (status === "completed") {
+    const result = runpodJob.result || {};
+    const images = Array.isArray(result.images) ? result.images : [];
+    const comfyPromptId = images[0]?.comfyPromptId || result.comfyPromptId || localPayload.runpodJobId || "";
+    await env.DB.prepare("UPDATE generation_tasks SET status = ?, progress = ?, images = ?, message = ?, comfy_prompt_id = ?, updated_at = ?, completed_at = ? WHERE id = ?")
+      .bind("completed", 100, JSON.stringify(images), message || "ComfyUI generation completed", comfyPromptId, nowIso(), nowIso(), localJob.generation_task_id)
+      .run();
+  } else if (status === "failed") {
+    await env.DB.prepare("UPDATE generation_tasks SET status = ?, progress = ?, message = ?, updated_at = ? WHERE id = ?")
+      .bind("failed", progress, message || "ComfyUI generation failed", nowIso(), localJob.generation_task_id)
+      .run();
+  } else {
+    await env.DB.prepare("UPDATE generation_tasks SET status = ?, progress = ?, message = ?, updated_at = ? WHERE id = ?")
+      .bind("running", progress, message || "ComfyUI generation running", nowIso(), localJob.generation_task_id)
+      .run();
+  }
+}
+
+function comfyLoraFile(lora) {
+  const modelPath = lora.model_path || "";
+  const marker = "/models/loras/";
+  if (modelPath.includes(marker)) return modelPath.split(marker, 2)[1];
+  if (modelPath.endsWith(".safetensors")) return `${USER_ID}/${modelPath.split("/").pop()}`;
+  return `${USER_ID}/${lora.id}.safetensors`;
 }
 
 async function syncDatasetProcessingResult(env, localJob, runpodJob, status, progress) {
