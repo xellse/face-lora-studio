@@ -49,13 +49,19 @@ HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN"
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-3-flash-preview")
 FACE_DETECTOR = os.environ.get("FACE_DETECTOR", "opencv").strip().lower()
+FACE_CROP_SCALE = float(os.environ.get("FACE_CROP_SCALE", "2.15"))
+YUNET_MODEL_URL = os.environ.get(
+    "YUNET_MODEL_URL",
+    "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx",
+)
+YUNET_MODEL_PATH = Path(os.environ.get("YUNET_MODEL_PATH", MODEL_CACHE_DIR / "face-detection/face_detection_yunet_2023mar.onnx"))
 R2_ENDPOINT = os.environ.get("R2_ENDPOINT", "")
 R2_BUCKET = os.environ.get("R2_BUCKET", "face-lora-assets")
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 PUBLIC_STORAGE_BASE_URL = os.environ.get("PUBLIC_STORAGE_BASE_URL", "https://img.xellsun.com").rstrip("/")
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 
 app = FastAPI(title="Face LoRA RunPod Worker", version=APP_VERSION)
 
@@ -135,7 +141,10 @@ def health():
         },
         "datasetProcessing": {
             "faceDetector": FACE_DETECTOR,
+            "faceCropScale": FACE_CROP_SCALE,
             "opencvConfigured": cv2 is not None,
+            "yunetModelPath": str(YUNET_MODEL_PATH),
+            "yunetModelDeployed": YUNET_MODEL_PATH.exists(),
             "visionProvider": "openrouter",
             "visionModel": OPENROUTER_MODEL,
             "cropPolicy": "face_center_square_crop_resize_only",
@@ -325,6 +334,7 @@ def process_dataset(job_id: str, payload: DatasetJobRequest):
                 "cropSize": payload.crop_size,
                 "sourceUrl": raw.url,
                 "faceDetector": analysis.get("detector", FACE_DETECTOR),
+                "faceConfidence": analysis.get("confidence"),
             })
 
         update_job(job_id, 100, "completed", "Dataset crop and caption completed", {
@@ -333,6 +343,7 @@ def process_dataset(job_id: str, payload: DatasetJobRequest):
             "cropSize": payload.crop_size,
             "visionModel": OPENROUTER_MODEL,
             "faceDetector": FACE_DETECTOR,
+            "faceCropScale": FACE_CROP_SCALE,
         })
     except Exception as exc:
         update_job(job_id, 100, "failed", f"Dataset processing failed: {exc}", {
@@ -403,12 +414,76 @@ Rules:
 
 
 def detect_face_geometry(image: Image.Image) -> dict[str, Any]:
-    if FACE_DETECTOR == "opencv":
-        return detect_face_with_opencv(image)
+    if FACE_DETECTOR in {"opencv", "opencv-yunet", "yunet"}:
+        try:
+            return detect_face_with_yunet(image)
+        except Exception as exc:
+            if FACE_DETECTOR == "yunet":
+                raise
+            fallback = detect_face_with_haar(image)
+            fallback["detector"] = f'{fallback.get("detector", "opencv:haar")} fallback after yunet failed: {exc}'
+            return fallback
+    if FACE_DETECTOR in {"haar", "opencv-haar"}:
+        return detect_face_with_haar(image)
     raise RuntimeError(f"Unsupported FACE_DETECTOR={FACE_DETECTOR}")
 
 
-def detect_face_with_opencv(image: Image.Image) -> dict[str, Any]:
+def detect_face_with_yunet(image: Image.Image) -> dict[str, Any]:
+    if cv2 is None:
+        raise RuntimeError("opencv-python-headless is not installed")
+    model_path = ensure_yunet_model()
+    rgb = np_image_rgb(image)
+    height, width = rgb.shape[:2]
+    max_side = max(width, height)
+    scale = 1.0
+    infer_rgb = rgb
+    if max_side > 1920:
+        scale = 1920 / max_side
+        infer_rgb = cv2.resize(rgb, (int(width * scale), int(height * scale)), interpolation=cv2.INTER_AREA)
+    infer_height, infer_width = infer_rgb.shape[:2]
+    bgr = cv2.cvtColor(infer_rgb, cv2.COLOR_RGB2BGR)
+    detector = create_yunet_detector(model_path, infer_width, infer_height)
+    _, detections = detector.detect(bgr)
+    if detections is None or len(detections) == 0:
+        raise RuntimeError("YuNet found no face")
+    candidates = []
+    for detection in detections:
+        x, y, w, h = [float(value) / scale for value in detection[:4]]
+        confidence = float(detection[-1])
+        if w < 24 or h < 24:
+            continue
+        area = (w * h) / max(1, width * height)
+        # Prefer high-confidence face boxes, but keep enough weight on area so tiny background faces lose.
+        score = confidence * 4 + min(area * 20, 1.5)
+        candidates.append((score, confidence, x, y, w, h))
+    if not candidates:
+        raise RuntimeError("YuNet face boxes were too small")
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    _, confidence, x, y, w, h = candidates[0]
+    return face_detection_result("opencv:yunet", x, y, w, h, width, height, confidence)
+
+
+def create_yunet_detector(model_path: Path, width: int, height: int):
+    if hasattr(cv2, "FaceDetectorYN"):
+        return cv2.FaceDetectorYN.create(str(model_path), "", (width, height), 0.55, 0.3, 5000)
+    if hasattr(cv2, "FaceDetectorYN_create"):
+        return cv2.FaceDetectorYN_create(str(model_path), "", (width, height), 0.55, 0.3, 5000)
+    raise RuntimeError("OpenCV FaceDetectorYN is not available")
+
+
+def ensure_yunet_model() -> Path:
+    if YUNET_MODEL_PATH.exists() and YUNET_MODEL_PATH.stat().st_size > 0:
+        return YUNET_MODEL_PATH
+    YUNET_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    response = requests.get(YUNET_MODEL_URL, timeout=90)
+    response.raise_for_status()
+    YUNET_MODEL_PATH.write_bytes(response.content)
+    if YUNET_MODEL_PATH.stat().st_size < 100_000:
+        raise RuntimeError(f"Downloaded YuNet model is unexpectedly small: {YUNET_MODEL_PATH.stat().st_size} bytes")
+    return YUNET_MODEL_PATH
+
+
+def detect_face_with_haar(image: Image.Image) -> dict[str, Any]:
     if cv2 is None:
         raise RuntimeError("opencv-python-headless is not installed")
     rgb = np_image_rgb(image)
@@ -429,25 +504,32 @@ def detect_face_with_opencv(image: Image.Image) -> dict[str, Any]:
     height, width = gray.shape[:2]
     faces.sort(key=lambda face: face[3] * face[4], reverse=True)
     label, x, y, w, h = faces[0]
+    return face_detection_result(f"opencv:haar:{label}", x, y, w, h, width, height, None)
+
+
+def face_detection_result(detector: str, x: float, y: float, w: float, h: float, image_width: int, image_height: int, confidence: float | None) -> dict[str, Any]:
     face = {
-        "centerX": clamp((x + w / 2) / width, 0, 1),
-        "centerY": clamp((y + h / 2) / height, 0, 1),
-        "width": clamp(w / width, 0.03, 1),
-        "height": clamp(h / height, 0.03, 1),
+        "centerX": clamp((x + w / 2) / image_width, 0, 1),
+        "centerY": clamp((y + h / 2) / image_height, 0, 1),
+        "width": clamp(w / image_width, 0.03, 1),
+        "height": clamp(h / image_height, 0.03, 1),
     }
-    return {
+    result = {
         "usable": True,
         "reason": "",
-        "detector": f"opencv:{label}",
+        "detector": detector,
         "containsBodyInFaceBox": False,
         "face": face,
         "bbox": {
-            "x": clamp(x / width, 0, 1),
-            "y": clamp(y / height, 0, 1),
+            "x": clamp(x / image_width, 0, 1),
+            "y": clamp(y / image_height, 0, 1),
             "width": face["width"],
             "height": face["height"],
         },
     }
+    if confidence is not None:
+        result["confidence"] = round(confidence, 4)
+    return result
 
 
 def np_image_rgb(image: Image.Image):
@@ -480,7 +562,7 @@ def crop_face(image: Image.Image, analysis: dict[str, Any], crop_size: int) -> I
 
     # Crop a square directly from the original image, centered on the detected face.
     # Resizing this square to crop_size is proportional scaling, not distortion.
-    desired_side = max(face_width * 1.35, face_height * 1.25)
+    desired_side = max(face_width, face_height) * FACE_CROP_SCALE
     max_centered_side = max_square_side_centered_in_image(cx, cy, width, height)
     side_px = int(round(min(desired_side, max_centered_side, min(width, height))))
     side_px = max(2, side_px)
