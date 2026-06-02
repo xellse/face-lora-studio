@@ -24,7 +24,8 @@ COMFY_BASE_URL = os.environ.get("COMFY_BASE_URL", "http://127.0.0.1:8188").rstri
 WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
 Z_IMAGE_BASE_MODEL = "z-image-base"
 Z_IMAGE_REPO = "Tongyi-MAI/Z-Image"
-Z_IMAGE_ARCH = os.environ.get("Z_IMAGE_ARCH", "z_image")
+Z_IMAGE_ARCH = os.environ.get("Z_IMAGE_ARCH", "zimage").strip()
+Z_IMAGE_ARCH = {"z_image": "zimage", "z-image": "zimage"}.get(Z_IMAGE_ARCH, Z_IMAGE_ARCH)
 AI_TOOLKIT_DIR = WORKSPACE / "ai-toolkit"
 MODEL_CACHE_DIR = Path(os.environ.get("MODEL_CACHE_DIR", WORKSPACE / "models"))
 Z_IMAGE_MODEL_DIR = Path(os.environ.get("Z_IMAGE_MODEL_DIR", MODEL_CACHE_DIR / "z-image-base"))
@@ -37,7 +38,7 @@ R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 PUBLIC_STORAGE_BASE_URL = os.environ.get("PUBLIC_STORAGE_BASE_URL", "https://img.xellsun.com").rstrip("/")
 
-APP_VERSION = "0.1.5"
+APP_VERSION = "0.1.6"
 
 app = FastAPI(title="Face LoRA RunPod Worker", version=APP_VERSION)
 
@@ -671,6 +672,9 @@ config:
         name_or_path: "{yaml_escape(str(model_path))}"
         arch: "{yaml_escape(Z_IMAGE_ARCH)}"
         quantize: true
+        qtype: "qfloat8"
+        quantize_te: true
+        qtype_te: "qfloat8"
         low_vram: false
       sample:
         sampler: "flowmatch"
