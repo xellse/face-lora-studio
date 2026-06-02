@@ -39,7 +39,7 @@ R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 PUBLIC_STORAGE_BASE_URL = os.environ.get("PUBLIC_STORAGE_BASE_URL", "https://img.xellsun.com").rstrip("/")
 
-APP_VERSION = "0.1.8"
+APP_VERSION = "0.1.9"
 
 app = FastAPI(title="Face LoRA RunPod Worker", version=APP_VERSION)
 
@@ -981,11 +981,17 @@ def comfy_lora_name(payload: GenerationJobRequest) -> str:
 
 
 def queue_comfy_prompt(workflow: dict[str, Any], job_id: str) -> str:
+    debug_dir = JOBS_DIR / job_id
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    (debug_dir / "comfy_prompt.json").write_text(json.dumps(workflow, indent=2, ensure_ascii=False))
     response = requests.post(f"{COMFY_BASE_URL}/prompt", json={
         "prompt": workflow,
         "client_id": job_id,
     }, timeout=30)
-    response.raise_for_status()
+    if not response.ok:
+        error_text = response.text[:4000]
+        append_job_log(job_id, f"ComfyUI /prompt error {response.status_code}: {error_text}", status="running")
+        raise RuntimeError(f"ComfyUI /prompt failed with {response.status_code}: {error_text}")
     payload = response.json()
     prompt_id = payload.get("prompt_id")
     if not prompt_id:
