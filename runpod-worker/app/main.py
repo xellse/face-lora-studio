@@ -18,12 +18,22 @@ from PIL import Image, ImageDraw, ImageOps
 from pydantic import BaseModel, Field
 
 try:
+    from dotenv import load_dotenv
+except Exception:
+    load_dotenv = None
+
+try:
     import cv2
 except Exception:
     cv2 = None
 
 
 WORKSPACE = Path(os.environ.get("RUNPOD_WORKSPACE", "/workspace"))
+if load_dotenv is not None:
+    for env_file in (WORKSPACE / ".env", Path(__file__).resolve().parents[1] / ".env"):
+        if env_file.exists():
+            load_dotenv(env_file)
+
 JOBS_DIR = WORKSPACE / "jobs"
 COMFY_BASE_URL = os.environ.get("COMFY_BASE_URL", "http://127.0.0.1:8188").rstrip("/")
 COMFY_WORKFLOW_PATH = Path(os.environ.get("COMFY_WORKFLOW_PATH", WORKSPACE / "ComfyUI/workflows/z_image_Lora.json"))
