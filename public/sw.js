@@ -1,5 +1,12 @@
-const CACHE = "face-lora-studio-v2";
-const ASSETS = ["/", "/index.html", "/styles.css", "/app.js", "/manifest.webmanifest", "/icon.svg"];
+const CACHE = "face-lora-studio-v3-training-presets";
+const ASSETS = [
+  "/",
+  "/index.html",
+  "/styles.css?v=20260602-training-presets",
+  "/app.js?v=20260602-training-presets",
+  "/manifest.webmanifest",
+  "/icon.svg"
+];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(ASSETS)));
