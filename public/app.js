@@ -260,8 +260,35 @@ function generateView(data) {
     steps: state.generationDraft.steps ?? "40",
     cfg: state.generationDraft.cfg ?? "5",
     sampler: state.generationDraft.sampler ?? "euler",
+    scheduler: state.generationDraft.scheduler ?? "normal",
     loraWeight: state.generationDraft.loraWeight ?? "0.85"
   };
+  const samplerOptions = [
+    "euler",
+    "euler_ancestral",
+    "heun",
+    "dpm_2",
+    "dpm_2_ancestral",
+    "lms",
+    "dpm_fast",
+    "dpm_adaptive",
+    "dpmpp_2s_ancestral",
+    "dpmpp_sde",
+    "dpmpp_sde_gpu",
+    "dpmpp_2m",
+    "dpmpp_2m_sde",
+    "dpmpp_2m_sde_gpu",
+    "dpmpp_3m_sde",
+    "dpmpp_3m_sde_gpu",
+    "ddpm",
+    "lcm",
+    "ipndm",
+    "ipndm_v",
+    "deis",
+    "uni_pc",
+    "uni_pc_bh2"
+  ];
+  const schedulerOptions = ["normal", "karras", "exponential", "sgm_uniform", "simple", "ddim_uniform", "beta", "turbo"];
   return `
     <section class="two-col">
       <form id="generationForm" class="panel">
@@ -277,16 +304,19 @@ function generateView(data) {
           <label>负向提示词<textarea name="negativePrompt">${escapeHtml(draft.negativePrompt)}</textarea></label>
           <div class="form-grid">
             <label>数量<input name="count" type="number" value="${escapeHtml(draft.count)}" min="1" max="12" /></label>
-            <label>宽度<input name="width" type="number" value="${escapeHtml(draft.width)}" min="512" max="1536" step="64" /></label>
-            <label>高度<input name="height" type="number" value="${escapeHtml(draft.height)}" min="512" max="1536" step="64" /></label>
+            <label>宽度<input name="width" type="number" value="${escapeHtml(draft.width)}" min="512" max="2048" step="64" /></label>
+            <label>高度<input name="height" type="number" value="${escapeHtml(draft.height)}" min="512" max="${escapeHtml(draft.width)}" step="64" /></label>
             <label>Seed<input name="seed" type="number" value="${escapeHtml(draft.seed)}" placeholder="random" /></label>
-            <label>Steps<input name="steps" type="number" value="${escapeHtml(draft.steps)}" min="20" max="80" /></label>
+            <label>Steps<input name="steps" type="number" value="${escapeHtml(draft.steps)}" min="15" max="80" /></label>
             <label>CFG<input name="cfg" type="number" value="${escapeHtml(draft.cfg)}" min="1" max="12" step="0.1" /></label>
             <label>Sampler
               <select name="sampler">
-                <option value="euler" ${draft.sampler === "euler" ? "selected" : ""}>euler</option>
-                <option value="dpmpp_2m" ${draft.sampler === "dpmpp_2m" ? "selected" : ""}>dpmpp_2m</option>
-                <option value="dpmpp_sde" ${draft.sampler === "dpmpp_sde" ? "selected" : ""}>dpmpp_sde</option>
+                ${samplerOptions.map((option) => `<option value="${option}" ${draft.sampler === option ? "selected" : ""}>${option}</option>`).join("")}
+              </select>
+            </label>
+            <label>Scheduler
+              <select name="scheduler">
+                ${schedulerOptions.map((option) => `<option value="${option}" ${draft.scheduler === option ? "selected" : ""}>${option}</option>`).join("")}
               </select>
             </label>
             <label>LoRA 权重<input name="loraWeight" type="number" value="${escapeHtml(draft.loraWeight)}" min="0" max="1.5" step="0.05" /></label>
@@ -499,12 +529,31 @@ function bindTabEvents() {
 
   document.querySelector("#generationForm")?.addEventListener("submit", async (event) => {
     event.preventDefault();
-    await api("/api/generation", { method: "POST", body: Object.fromEntries(new FormData(event.currentTarget)) });
+    const body = normalizeGenerationBody(Object.fromEntries(new FormData(event.currentTarget)));
+    if (body.height > body.width) {
+      showToast("高度不能大于宽度");
+      return;
+    }
+    await api("/api/generation", { method: "POST", body });
     state.generationDraft = {};
     state.tab = "gallery";
     showToast("Generation queued");
     await refresh({ force: true });
   });
+}
+
+function normalizeGenerationBody(body) {
+  const width = Number(body.width || 1024);
+  const height = Number(body.height || 1024);
+  return {
+    ...body,
+    count: Number(body.count || 1),
+    width,
+    height,
+    steps: Math.max(15, Number(body.steps || 40)),
+    cfg: Number(body.cfg || 5),
+    loraWeight: Number(body.loraWeight || 0.85)
+  };
 }
 
 function bindDraftForm(selector, draftKey) {

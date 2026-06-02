@@ -275,14 +275,17 @@ async function createGenerationTask(request, env) {
   const now = nowIso();
   const taskId = id("gen");
   const count = clamp(Number(body.count || 4), 1, 12);
+  const width = clamp(Number(body.width || 1024), 512, 2048);
+  const height = clamp(Number(body.height || 1024), 512, width);
   const settings = {
     count,
-    width: Number(body.width || 1024),
-    height: Number(body.height || 1024),
+    width,
+    height,
     seed: body.seed ? Number(body.seed) : Math.floor(Math.random() * 2_000_000_000),
-    steps: Number(body.steps || 40),
+    steps: clamp(Number(body.steps || 40), 15, 150),
     cfg: Number(body.cfg || 5),
     sampler: body.sampler || "euler",
+    scheduler: body.scheduler || "normal",
     loraWeight: Number(body.loraWeight || 0.85)
   };
   const runpodJob = await callRunPod(env, "/jobs/generate", {

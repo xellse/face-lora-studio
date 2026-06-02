@@ -21,7 +21,7 @@ from pydantic import BaseModel, Field
 WORKSPACE = Path(os.environ.get("RUNPOD_WORKSPACE", "/workspace"))
 JOBS_DIR = WORKSPACE / "jobs"
 COMFY_BASE_URL = os.environ.get("COMFY_BASE_URL", "http://127.0.0.1:8188").rstrip("/")
-COMFY_WORKFLOW_PATH = Path(os.environ.get("COMFY_WORKFLOW_PATH", WORKSPACE / "ComfyUI/workflows/zimage_lora_api.json"))
+COMFY_WORKFLOW_PATH = Path(os.environ.get("COMFY_WORKFLOW_PATH", WORKSPACE / "ComfyUI/workflows/z_image_Lora.json"))
 WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
 Z_IMAGE_BASE_MODEL = "z-image-base"
 Z_IMAGE_REPO = "Tongyi-MAI/Z-Image"
@@ -39,7 +39,7 @@ R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 PUBLIC_STORAGE_BASE_URL = os.environ.get("PUBLIC_STORAGE_BASE_URL", "https://img.xellsun.com").rstrip("/")
 
-APP_VERSION = "0.1.7"
+APP_VERSION = "0.1.8"
 
 app = FastAPI(title="Face LoRA RunPod Worker", version=APP_VERSION)
 
@@ -861,14 +861,17 @@ def process_generation(job_id: str, payload: GenerationJobRequest):
 
 
 def generation_settings(settings: dict[str, Any]) -> dict[str, Any]:
+    width = max(512, min(2048, int(settings.get("width", 1024))))
+    height = max(512, min(width, int(settings.get("height", 1024))))
     return {
         "count": max(1, min(12, int(settings.get("count", 1)))),
-        "width": int(settings.get("width", 1024)),
-        "height": int(settings.get("height", 1024)),
+        "width": width,
+        "height": height,
         "seed": int(settings.get("seed", random_seed())),
-        "steps": int(settings.get("steps", 40)),
+        "steps": max(15, min(150, int(settings.get("steps", 40)))),
         "cfg": float(settings.get("cfg", 5)),
         "sampler": str(settings.get("sampler", "euler")),
+        "scheduler": str(settings.get("scheduler", "normal")),
         "loraWeight": float(settings.get("loraWeight", 0.85)),
     }
 
@@ -898,6 +901,7 @@ def patch_generation_workflow(workflow: dict[str, Any], payload: GenerationJobRe
         "__STEPS__": settings["steps"],
         "__CFG__": settings["cfg"],
         "__SAMPLER__": settings["sampler"],
+        "__SCHEDULER__": settings["scheduler"],
         "__TASK_ID__": payload.task_id,
         "__INDEX__": index + 1,
     }
@@ -922,6 +926,7 @@ def patch_generation_workflow(workflow: dict[str, Any], payload: GenerationJobRe
             set_existing(inputs, ["steps"], settings["steps"])
             set_existing(inputs, ["cfg"], settings["cfg"])
             set_existing(inputs, ["sampler_name", "sampler"], settings["sampler"])
+            set_existing(inputs, ["scheduler"], settings["scheduler"])
 
         if "emptylatentimage" in lower_class or "latent" in lower_class:
             set_existing(inputs, ["width"], settings["width"])
