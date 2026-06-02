@@ -229,9 +229,9 @@ function trainView(data) {
     trainTextEncoder: state.trainingDraft.trainTextEncoder ?? "false",
     quantize: state.trainingDraft.quantize ?? "true",
     quantizeTe: state.trainingDraft.quantizeTe ?? "true",
-    lowVram: state.trainingDraft.lowVram ?? "false",
-    layerOffloading: state.trainingDraft.layerOffloading ?? "false",
-    disableSampling: state.trainingDraft.disableSampling ?? "false",
+    lowVram: state.trainingDraft.lowVram ?? "true",
+    layerOffloading: state.trainingDraft.layerOffloading ?? "true",
+    disableSampling: state.trainingDraft.disableSampling ?? "true",
     bypassGuidanceEmbedding: state.trainingDraft.bypassGuidanceEmbedding ?? "false",
     useEma: state.trainingDraft.useEma ?? "false",
     emaDecay: state.trainingDraft.emaDecay ?? "0.99"
@@ -303,9 +303,9 @@ function trainView(data) {
             ${trainingCheckbox("trainTextEncoder", "训练 Text Encoder", draft.trainTextEncoder)}
             ${trainingCheckbox("quantize", "量化 Transformer", draft.quantize)}
             ${trainingCheckbox("quantizeTe", "量化 Text Encoder", draft.quantizeTe)}
-            ${trainingCheckbox("lowVram", "Low VRAM", draft.lowVram)}
-            ${trainingCheckbox("layerOffloading", "Layer Offloading", draft.layerOffloading)}
-            ${trainingCheckbox("disableSampling", "关闭训练预览", draft.disableSampling)}
+            ${trainingCheckbox("lowVram", "Low VRAM 稳定模式", draft.lowVram)}
+            ${trainingCheckbox("layerOffloading", "Layer Offloading 稳定模式", draft.layerOffloading)}
+            ${trainingCheckbox("disableSampling", "关闭训练预览节省显存", draft.disableSampling)}
             ${trainingCheckbox("bypassGuidanceEmbedding", "Bypass Guidance Embedding", draft.bypassGuidanceEmbedding)}
             ${trainingCheckbox("useEma", "启用 EMA", draft.useEma)}
             <label>EMA Decay<input name="emaDecay" type="number" value="${escapeHtml(draft.emaDecay)}" min="0.9" max="0.9999" step="0.001" /></label>

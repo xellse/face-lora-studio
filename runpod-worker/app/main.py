@@ -876,7 +876,7 @@ config:
         content_or_style: "{yaml_escape(parameters["contentOrStyle"])}"
         optimizer_params:
           weight_decay: {parameters["weightDecay"]}
-        unload_text_encoder: false
+        unload_text_encoder: true
         lr: {parameters["learningRate"]}
         ema_config:
           use_ema: {yaml_bool(parameters["useEma"])}
@@ -925,9 +925,12 @@ def run_ai_toolkit(job_id: str, config_path: Path) -> Path:
         raise RuntimeError(f"AI Toolkit run.py not found at {AI_TOOLKIT_DIR}")
 
     command = ["python", "run.py", str(config_path)]
+    env = os.environ.copy()
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     process = subprocess.Popen(
         command,
         cwd=AI_TOOLKIT_DIR,
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -1021,9 +1024,9 @@ def z_image_training_parameters(parameters: dict[str, Any]) -> dict[str, Any]:
         "trainTextEncoder": bool_param(parameters.get("trainTextEncoder", False)),
         "quantize": bool_param(parameters.get("quantize", True)),
         "quantizeTe": bool_param(parameters.get("quantizeTe", True)),
-        "lowVram": bool_param(parameters.get("lowVram", False)),
-        "layerOffloading": bool_param(parameters.get("layerOffloading", False)),
-        "disableSampling": bool_param(parameters.get("disableSampling", False)),
+        "lowVram": bool_param(parameters.get("lowVram", True)),
+        "layerOffloading": bool_param(parameters.get("layerOffloading", True)),
+        "disableSampling": bool_param(parameters.get("disableSampling", True)),
         "bypassGuidanceEmbedding": bool_param(parameters.get("bypassGuidanceEmbedding", False)),
         "useEma": bool_param(parameters.get("useEma", False)),
         "emaDecay": float(parameters.get("emaDecay", 0.99)),
