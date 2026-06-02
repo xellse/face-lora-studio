@@ -304,7 +304,17 @@ def process_dataset(job_id: str, payload: DatasetJobRequest):
 
             object_key = f"datasets/{payload.dataset_id}/faces/{face_id}.jpg"
             https_url = upload_file_to_r2(face_path, object_key, "image/jpeg")
-            caption = caption_face_with_openrouter(https_url, payload.trigger_word)
+            try:
+                caption = caption_face_with_openrouter(https_url, payload.trigger_word)
+            except Exception as exc:
+                review_items.append({
+                    "id": raw.id,
+                    "reason": f"Caption rejected cropped face: {exc}",
+                    "sourceUrl": raw.url,
+                    "cropUrl": https_url,
+                    "faceDetector": analysis.get("detector", FACE_DETECTOR),
+                })
+                continue
             (faces_dir / f"{face_id}.txt").write_text(caption)
             faces.append({
                 "id": face_id,
@@ -354,6 +364,8 @@ Rules:
 - Mention upper clothing only if it is visible near the neck and useful context; keep it brief.
 - Do not describe background, pose, body, hands, camera props, scene location, watermarks, or text.
 - Do not include real names, celebrity names, identity claims, or unsupported personality claims.
+- Set usable=false only when there is no visible human face, the face is almost fully blocked, the image is corrupted, or the face is too tiny to describe.
+- Do not reject mild or moderate blur, soft focus, low light, compression artifacts, beauty filters, or shallow depth of field; describe the visible face traits anyway.
 - Keep the caption one concise comma-separated sentence, 35 to 80 words.
 - Include the trigger word exactly once in the caption: {trigger_word}
 """
