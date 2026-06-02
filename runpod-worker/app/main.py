@@ -13,6 +13,7 @@ from typing import Any
 import boto3
 import requests
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
+from huggingface_hub import snapshot_download
 from PIL import Image, ImageDraw, ImageOps
 from pydantic import BaseModel, Field
 
@@ -23,7 +24,11 @@ COMFY_BASE_URL = os.environ.get("COMFY_BASE_URL", "http://127.0.0.1:8188").rstri
 WORKER_TOKEN = os.environ.get("WORKER_TOKEN", "")
 Z_IMAGE_BASE_MODEL = "z-image-base"
 Z_IMAGE_REPO = "Tongyi-MAI/Z-Image"
+Z_IMAGE_ARCH = os.environ.get("Z_IMAGE_ARCH", "z_image")
 AI_TOOLKIT_DIR = WORKSPACE / "ai-toolkit"
+MODEL_CACHE_DIR = Path(os.environ.get("MODEL_CACHE_DIR", WORKSPACE / "models"))
+Z_IMAGE_MODEL_DIR = Path(os.environ.get("Z_IMAGE_MODEL_DIR", MODEL_CACHE_DIR / "z-image-base"))
+HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "google/gemini-3-flash-preview")
 R2_ENDPOINT = os.environ.get("R2_ENDPOINT", "")
@@ -32,7 +37,7 @@ R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 PUBLIC_STORAGE_BASE_URL = os.environ.get("PUBLIC_STORAGE_BASE_URL", "https://img.xellsun.com").rstrip("/")
 
-APP_VERSION = "0.1.4"
+APP_VERSION = "0.1.5"
 
 app = FastAPI(title="Face LoRA RunPod Worker", version=APP_VERSION)
 
@@ -102,8 +107,10 @@ def health():
         "version": APP_VERSION,
         "defaultModel": {
             "id": Z_IMAGE_BASE_MODEL,
-            "architecture": "z-image",
+            "architecture": Z_IMAGE_ARCH,
             "repo": Z_IMAGE_REPO,
+            "localPath": str(Z_IMAGE_MODEL_DIR),
+            "deployed": z_image_model_is_ready(),
         },
         "datasetProcessing": {
             "visionProvider": "openrouter",
@@ -117,6 +124,8 @@ def health():
             "jobs": str(JOBS_DIR),
             "comfy": str(WORKSPACE / "ComfyUI"),
             "aiToolkit": str(WORKSPACE / "ai-toolkit"),
+            "models": str(MODEL_CACHE_DIR),
+            "zImageBase": str(Z_IMAGE_MODEL_DIR),
             "loras": str(WORKSPACE / "ComfyUI/models/loras/local-user"),
         },
         "comfy": comfy,
@@ -141,6 +150,22 @@ def create_training_job(payload: TrainingJobRequest, background_tasks: Backgroun
 def create_generation_job(payload: GenerationJobRequest, background_tasks: BackgroundTasks):
     job = create_job("generation", payload.model_dump(by_alias=True))
     background_tasks.add_task(simulate_generation, job["id"])
+    return job
+
+
+@app.get("/models/z-image/status", dependencies=[Depends(require_token)])
+def get_z_image_model_status():
+    return z_image_model_status()
+
+
+@app.post("/models/z-image/prepare", dependencies=[Depends(require_token)])
+def prepare_z_image_model(background_tasks: BackgroundTasks):
+    job = create_job("model_prepare", {
+        "model": Z_IMAGE_BASE_MODEL,
+        "repo": Z_IMAGE_REPO,
+        "targetPath": str(Z_IMAGE_MODEL_DIR),
+    })
+    background_tasks.add_task(prepare_z_image_model_job, job["id"])
     return job
 
 
@@ -450,16 +475,92 @@ def upload_file_to_r2(path: Path, key: str, content_type: str) -> str:
     return f"{PUBLIC_STORAGE_BASE_URL}/{key}"
 
 
+def prepare_z_image_model_job(job_id: str):
+    try:
+        update_job(job_id, 5, "running", "Preparing local Z-Image Base model directory")
+        model_path = ensure_z_image_base_model(job_id)
+        update_job(job_id, 100, "completed", "Z-Image Base model deployed locally", {
+            **z_image_model_status(),
+            "localPath": str(model_path),
+        })
+    except Exception as exc:
+        update_job(job_id, 100, "failed", f"Z-Image Base model deployment failed: {exc}", {
+            "error": str(exc),
+            **z_image_model_status(),
+        })
+
+
+def ensure_z_image_base_model(job_id: str | None = None) -> Path:
+    Z_IMAGE_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+    if z_image_model_is_ready():
+        if job_id:
+            append_job_log(job_id, f"Z-Image Base already deployed at {Z_IMAGE_MODEL_DIR}", progress=10, status="running")
+        return Z_IMAGE_MODEL_DIR
+
+    if job_id:
+        append_job_log(job_id, f"Downloading {Z_IMAGE_REPO} to {Z_IMAGE_MODEL_DIR}", progress=7, status="running")
+    snapshot_download(
+        repo_id=Z_IMAGE_REPO,
+        local_dir=str(Z_IMAGE_MODEL_DIR),
+        token=HF_TOKEN,
+    )
+    marker_path = Z_IMAGE_MODEL_DIR / ".face_lora_model_ready.json"
+    marker_path.write_text(json.dumps({
+        "repo": Z_IMAGE_REPO,
+        "architecture": Z_IMAGE_ARCH,
+        "downloadedAt": now_iso(),
+    }, indent=2))
+    if job_id:
+        append_job_log(job_id, f"Z-Image Base deployed at {Z_IMAGE_MODEL_DIR}", progress=10, status="running")
+    return Z_IMAGE_MODEL_DIR
+
+
+def z_image_model_status() -> dict[str, Any]:
+    return {
+        "model": Z_IMAGE_BASE_MODEL,
+        "repo": Z_IMAGE_REPO,
+        "architecture": Z_IMAGE_ARCH,
+        "localPath": str(Z_IMAGE_MODEL_DIR),
+        "deployed": z_image_model_is_ready(),
+        "hfTokenConfigured": bool(HF_TOKEN),
+        "sizeBytes": directory_size(Z_IMAGE_MODEL_DIR) if Z_IMAGE_MODEL_DIR.exists() else 0,
+    }
+
+
+def z_image_model_is_ready() -> bool:
+    if not Z_IMAGE_MODEL_DIR.exists():
+        return False
+    if (Z_IMAGE_MODEL_DIR / ".face_lora_model_ready.json").exists():
+        return True
+    if (Z_IMAGE_MODEL_DIR / "model_index.json").exists():
+        return True
+    return any(Z_IMAGE_MODEL_DIR.rglob("*.safetensors"))
+
+
+def directory_size(path: Path) -> int:
+    total = 0
+    for file_path in path.rglob("*"):
+        if file_path.is_file():
+            try:
+                total += file_path.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
 def simulate_training(job_id: str, payload: TrainingJobRequest):
     try:
         if not payload.dataset_images:
             raise RuntimeError("No datasetImages were provided for training")
 
+        update_job(job_id, 6, "running", "Ensuring Z-Image Base model is deployed locally")
+        base_model_path = ensure_z_image_base_model(job_id)
+
         update_job(job_id, 10, "running", "Downloading training images and captions")
         dataset_dir = prepare_training_dataset(job_id, payload)
 
         update_job(job_id, 18, "running", "Writing Z-Image Base AI Toolkit config")
-        config_path = write_z_image_training_config(job_id, payload, dataset_dir)
+        config_path = write_z_image_training_config(job_id, payload, dataset_dir, base_model_path)
 
         update_job(job_id, 25, "running", "Starting AI Toolkit training", {
             "aiToolkitConfig": str(config_path),
@@ -473,6 +574,7 @@ def simulate_training(job_id: str, payload: TrainingJobRequest):
             "modelPath": str(model_path),
             "baseModel": Z_IMAGE_BASE_MODEL,
             "modelRepo": Z_IMAGE_REPO,
+            "baseModelLocalPath": str(base_model_path),
             "aiToolkitOutput": str(output_dir),
         })
     except Exception as exc:
@@ -521,7 +623,7 @@ def ensure_trigger_word(caption: str, trigger_word: str) -> str:
     return caption
 
 
-def write_z_image_training_config(job_id: str, payload: TrainingJobRequest, images_dir: Path) -> Path:
+def write_z_image_training_config(job_id: str, payload: TrainingJobRequest, images_dir: Path, model_path: Path) -> Path:
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     parameters = z_image_training_parameters(payload.parameters)
@@ -566,8 +668,8 @@ config:
         lr: {parameters["learningRate"]}
         dtype: bf16
       model:
-        name_or_path: "{Z_IMAGE_REPO}"
-        arch: "z_image"
+        name_or_path: "{yaml_escape(str(model_path))}"
+        arch: "{yaml_escape(Z_IMAGE_ARCH)}"
         quantize: true
         low_vram: false
       sample:

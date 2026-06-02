@@ -9,6 +9,8 @@ It provides:
 - `POST /jobs/train` downloads dataset images, writes captions, generates an AI Toolkit YAML config, runs `python run.py`, and installs the resulting `.safetensors` into ComfyUI
 - `POST /jobs/generate` placeholder for ComfyUI generation
 - `GET /jobs/{job_id}` for job status
+- `POST /models/z-image/prepare` downloads and pins Z-Image Base into the RunPod workspace
+- `GET /models/z-image/status` checks whether the local Z-Image Base model is ready
 
 The service is intentionally separate from ComfyUI. Cloudflare should call this worker, and this worker should call local ComfyUI at `http://127.0.0.1:8188`.
 
@@ -33,6 +35,10 @@ python -m pip install -r requirements.txt
 export RUNPOD_WORKSPACE=/workspace
 export COMFY_BASE_URL=http://127.0.0.1:8188
 export WORKER_TOKEN="change-this-to-a-long-random-value"
+export HF_TOKEN="your-huggingface-token-if-required"
+export MODEL_CACHE_DIR=/workspace/models
+export Z_IMAGE_MODEL_DIR=/workspace/models/z-image-base
+export Z_IMAGE_ARCH=z_image
 export OPENROUTER_API_KEY="your-openrouter-key"
 export OPENROUTER_MODEL="google/gemini-3-flash-preview"
 export R2_ENDPOINT="https://<account-id>.r2.cloudflarestorage.com"
@@ -52,6 +58,31 @@ Check locally in the Pod:
 ```bash
 curl http://127.0.0.1:4000/health
 ```
+
+## Prepare Z-Image Base for AI Toolkit
+
+Before starting LoRA training, deploy the base model into the persistent workspace:
+
+```bash
+curl -X POST http://127.0.0.1:4000/models/z-image/prepare \
+  -H "X-Worker-Token: $WORKER_TOKEN"
+```
+
+The response contains a RunPod worker job id. Poll it until completed:
+
+```bash
+curl http://127.0.0.1:4000/jobs/<job_id> \
+  -H "X-Worker-Token: $WORKER_TOKEN"
+```
+
+Check the final local model status:
+
+```bash
+curl http://127.0.0.1:4000/models/z-image/status \
+  -H "X-Worker-Token: $WORKER_TOKEN"
+```
+
+The training config will reference the local path, usually `/workspace/models/z-image-base`, as AI Toolkit's `model.name_or_path`.
 
 Check through RunPod proxy:
 
